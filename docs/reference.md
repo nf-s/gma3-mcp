@@ -13,6 +13,7 @@
 | `GMA3_OSC_PREFIX` | *(none)* | OSC prefix configured in onPC, without slashes |
 | `GMA3_INSTALL_DIR` | `~/MALightingTechnology` | Base folder containing versioned `gma3_<version>` directories; set explicitly on Windows |
 | `GMA3_HELP_DIR` | *(auto-detected)* | Override with the exact manual HTML directory (`gma3_<version>/shared/language/HTML`) |
+| `GMA3_DOCS_URL` | *(unset)* | Optional loopback HTTP origin for the separately managed documentation API; enables three read-only docs tools and indexed `gma3_help`. No redirects or hosted login. See [indexed docs](tools/docs.md). |
 
 ## Tools
 
@@ -31,7 +32,8 @@
 | `gma3_playback` | Go+, Go-, Pause, Off, Top, Flash, Load, ReSync, ... on a sequence, executor or tag; reads the playback state back a frame later (for a tag, every tagged sequence) ([docs](tools/live-reads.md), [resync](tools/tempo-sync.md#resync)) |
 | `gma3_set_fader` / `gma3_get_fader` | Fader levels via `SetFader` / `GetFader` |
 | `gma3_sequences`, `gma3_cues`, `gma3_executors`, `gma3_fixtures`, `gma3_pool` | Convenience views; sequences carry the current cue, and `gma3_cues` reads several sequences ([docs](tools/live-reads.md)) |
-| `gma3_help` | Read a page of the grandMA3 manual shipped with onPC |
+| `gma3_help` | Source-linked indexed lookup when configured, otherwise the manual shipped with onPC |
+| `gma3_docs_search`, `gma3_docs_get`, `gma3_docs_reference` | Optional bounded, versioned document search, text and exact command/scoped Lua extracts with full source provenance; no console connection required ([docs](tools/docs.md)) |
 | `gma3_start_bridge` | Start the plugin over OSC when the bridge is down |
 | `gma3_tempo_sync_status`, `gma3_configure_tempo_sync` | The tempo-sync plugin (bdstark/gma3-beat-sync): whether it is imported and running, its readings, and its configuration, read back; `gma3_playback` `resync` realigns running phasers ([docs](tools/tempo-sync.md)) |
 | `gma3_show_files`, `gma3_save_show` | List the show files and save the show under the current or a new name; another show's file needs `overwrite: true`; SaveShow's own confirmation is answered ([docs](tools/show.md)) |

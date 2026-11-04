@@ -39,7 +39,7 @@ automated checks and deployments still awaiting qualification.
 | Phasers | Build effects from structured steps or templates (dimmer chase, alternating colours, pan/tilt circle) with step timing, phase distribution, direction, repetition and speed, in the console's Preview environment, stored as presets and read back step by step; explicit audition and release |
 | Recipes | Read, add, change, reorder and remove recipe lines in presets and cue parts; cook a preset, cue part, cue or sequence with an explicit option after listing the affected targets and their predicted coverage, protecting uncooked cue data |
 | Structured inspection | Fixture attributes, programmer values, fixture output, DMX and supported cue contents |
-| Reference | Local grandMA3 manual, live Lua API descriptions and the `gma3://cheatsheet` resource |
+| Reference | Installed manual, optional separately managed versioned documentation index with source-linked command/Lua extracts, live Lua API descriptions and the `gma3://cheatsheet` resource |
 | Advanced control | Command-line commands and optional Lua execution |
 | Console input (opt-in) | Logical MA keys, raw PC keys, text and bounded input sequences with explicit ownership, once the operator enables input on the console |
 
@@ -121,5 +121,5 @@ Report suspected vulnerabilities privately using the [security policy](SECURITY.
 
 grandMA3 and MA Lighting are trademarks of MA Lighting Technology GmbH. This project is independent and is
 not affiliated with, endorsed by, or supported by MA Lighting. No MA Lighting documentation, code, or
-libraries are redistributed here: the help tool reads the manual from your own onPC installation at runtime,
+libraries are redistributed here: help reads your installed manual or an explicitly configured, separately managed local index at runtime,
 and the bridge plugin uses the LuaSocket and JSON libraries already shipped inside onPC.

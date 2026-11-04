@@ -5,6 +5,8 @@ import { z } from "zod";
 import { Gma3Bridge, BridgeError, BridgeUnreachableError } from "./bridge.js";
 import { OscSender } from "./osc.js";
 import { helpDir, helpVersion, listHelpPages, lookupHelp } from "./help.js";
+import { docsClientFromEnvironment, lookupIndexedHelp } from "./docs.js";
+import { registerDocsTools } from "./tools/docs.js";
 import { CHEATSHEET } from "./cheatsheet.js";
 import { MutationLock } from "./mutations.js";
 import { serverBuild } from "./buildinfo.js";
@@ -45,6 +47,7 @@ import { annotatePlayback, readTargetState, registerLiveStateTools, stateAfterFr
 import { registerPoolUsageTools, shapeListing } from "./tools/poolusage.js";
 
 const env = process.env;
+const docsClient = docsClientFromEnvironment();
 const bridge = new Gma3Bridge({
   host: env.GMA3_BRIDGE_HOST ?? "127.0.0.1",
   port: Number(env.GMA3_BRIDGE_PORT ?? 9800),
@@ -71,6 +74,7 @@ const server = new McpServer(
             `Tell the user before doing show work, and do not work around a missing tool with gma3_lua or gma3_command. ` +
             `To fix: ${startupBuild.action}. gma3_status reports the build state.`
         : undefined,
+      docsClient !== undefined,
     ),
   },
 );
@@ -653,7 +657,7 @@ server.registerTool(
     title: "grandMA3 manual lookup",
     description:
       "Look up a topic in the grandMA3 user manual shipped with onPC. Pass a command keyword (e.g. 'Go', 'Store', 'Assign', 'SendOSC', 'Lua', 'At', 'Fade') " +
-      "or a topic phrase (e.g. 'osc', 'cue timing', 'phaser'). Returns the page text, or a list of matching pages to choose from.",
+      "or a topic phrase (e.g. 'osc', 'cue timing', 'phaser'). Uses the versioned indexed corpus when GMA3_DOCS_URL is configured, otherwise the installed manual. Returns source-linked text or matching canonical identities; source examples are never executed.",
     inputSchema: {
       topic: z.string(),
       max_chars: z.number().int().positive().optional(),
@@ -661,6 +665,7 @@ server.registerTool(
   },
   async ({ topic, max_chars }) =>
     run(async () => {
+      if (docsClient) return lookupIndexedHelp(topic, max_chars, docsClient);
       const res = lookupHelp(topic, max_chars);
       if (res.error) throw new Error(res.error);
       if (res.text) return `# ${res.page} (grandMA3 ${helpVersion() ?? ""})\n\n${res.text}`;
@@ -675,6 +680,7 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 registerFixtureTools(server, toolContext);
+if (docsClient) registerDocsTools(server, docsClient);
 registerLayoutTools(server, toolContext);
 registerCueTools(server, toolContext);
 registerExecutorTools(server, toolContext);
