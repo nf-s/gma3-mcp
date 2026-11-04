@@ -54,7 +54,7 @@ class World {
     const fields = (args.fields as string[]) ?? [];
     let item: Record<string, unknown> | null = null;
     let m: RegExpMatchArray | null;
-    if ((m = ref.match(/^Sequence (\d+)$/))) {
+    if ((m = ref.match(/^Sequence (\d+)$/)) || (m = ref.match(/^14\.14\.1\.7\.(\d+)$/))) {
       const s = this.sequences.get(Number(m[1]));
       if (s) item = { ...this.seqSummary(s), fields: pick({ Name: s.name, No: s.index }, fields) };
     } else if ((m = ref.match(/^Page (\d+)$/))) {
@@ -441,7 +441,7 @@ test("label: sends Label Page <p>.<e> and verifies the executor view and the seq
       ["objects", "Page 2.201"],
       ["cmd", undefined],
       ["objects", "Page 2.201"],
-      ["objects", "Sequence 5"],
+      ["objects", "14.14.1.7.5"],
     ],
   );
   assertNoPlayback(h);
@@ -567,4 +567,68 @@ test("assign batch (review round 1): a partial item with an unanswered label sto
   assert.match(result.items[1].summary, /item 1 .* has a step without a reply that may have changed the console/);
   assert.equal(result.steps[0].status, "unknown", "the item's uncertainty is kept in its step");
   assert.deepEqual(h.fake.commands, ["Assign Sequence 5 At Page 1.201", 'Label Page 1.201 "Front"'], "Page 1.202 was never assigned");
+});
+
+test("object assignment rejects commands, ranges and ambiguous source forms before bridge reads", async () => {
+  for (const object of ["Macro 1; Off Sequence 1", "Macro 1 Thru 3", "Macro 0", "DataPool 10000 Macro 1", "Page 1.201", "Macro 1\nOff Sequence 1"]) {
+    const { isError } = await h.callJson("gma3_assign_to_executor", { object, page: 1, executor: 201 });
+    assert.equal(isError, true, object);
+  }
+  const both = await h.callJson("gma3_assign_to_executor", { sequence: 5, object: "Macro 3", page: 1, executor: 201 });
+  assert.match(both.result.validationErrors.join(" "), /exactly one/);
+  assert.deepEqual(h.fake.requests, []);
+});
+
+test("qualified macro assignment targets a distinct data pool without changing the current pool", async () => {
+  const macro = { class: "Macro", index: 5, name: "Busk", addr: "14.14.2.8.5" };
+  let assigned = false;
+  h.fake.on("objects", (args) => {
+    if (args.ref === "DataPool 2 Macro 5") return { items: [{ ...macro, fields: { Name: macro.name } }] };
+    if (args.ref === "DataPool 3 Page 1") return { items: [{ class: "Page", addr: "14.14.3.13.1", fields: { Name: "Page 1" } }] };
+    if (args.ref === "DataPool 3 Page 1.201") return { items: assigned ? [{ class: "Executor", fields: { Name: macro.name, Object: macro } }] : [] };
+    throw new Error(`unexpected reference ${String(args.ref)}`);
+  });
+  h.fake.on("cmd", (args) => {
+    assert.equal(args.command, "Assign DataPool 2 Macro 5 At DataPool 3 Page 1.201");
+    assigned = true;
+    return { feedback: "OK" };
+  });
+  const { result, isError } = await h.callJson("gma3_assign_to_executor", { object: "DataPool 2 Macro 5", data_pool: 3, page: 1, executor: 201 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.equal(result.resulting.object.addr, macro.addr);
+  assert.deepEqual(h.fake.commands, ["Assign DataPool 2 Macro 5 At DataPool 3 Page 1.201"]);
+});
+
+test("assignment verification rejects a same-name object with a different address", async () => {
+  let sent = false;
+  h.fake.on("objects", (args) => {
+    if (args.ref === "Macro 3") return { items: [{ class: "Macro", index: 3, addr: "14.14.1.8.3", name: "Shared", fields: { Name: "Shared" } }] };
+    if (args.ref === "Page 1") return { items: [{ class: "Page", fields: { Name: "Page 1" } }] };
+    if (args.ref === "Page 1.201") return { items: sent ? [{ fields: { Name: "Shared", Object: { class: "Macro", index: 4, addr: "14.14.1.8.4", name: "Shared" } } }] : [] };
+    throw new Error(`unexpected reference ${String(args.ref)}`);
+  });
+  h.fake.on("cmd", () => { sent = true; return { feedback: "OK" }; });
+  const { result, isError } = await h.callJson("gma3_assign_to_executor", { object: "Macro 3", page: 1, executor: 201 });
+  assert.equal(isError, true);
+  assert.equal(result.verification.status, "mismatched");
+  assert.equal(result.verification.expected.objectAddr, "14.14.1.8.3");
+  assert.equal(h.fake.commands.length, 1);
+});
+
+test("label reads an assigned object from another pool by address", async () => {
+  let name = "External";
+  const addr = "14.14.2.8.3";
+  h.fake.on("objects", (args) => {
+    if (args.ref === "Page 1") return { items: [{ fields: { Name: "Page 1" } }] };
+    if (args.ref === "Page 1.201") return { items: [{ fields: { Name: name, Object: { class: "Macro", index: 3, addr, name } } }] };
+    if (args.ref === addr) return { items: [{ name, fields: { Name: name } }] };
+    throw new Error(`unexpected reference ${String(args.ref)}`);
+  });
+  h.fake.on("cmd", () => { name = "Renamed"; return { feedback: "OK" }; });
+  const { result, isError } = await h.callJson("gma3_label_executor", { page: 1, executor: 201, label: "Renamed" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.assignedObjectAddr, addr);
+  assert.equal(result.verification.status, "matched");
+  assert.equal(h.fake.requests.at(-1)?.args.ref, addr);
 });

@@ -2,7 +2,7 @@ import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
-import { registerPlaybackTools, functionName, lockState, EXECUTOR_FUNCTIONS } from "../src/tools/playback.ts";
+import { registerPlaybackTools, functionName, lockState, executorFootprint, EXECUTOR_FUNCTIONS } from "../src/tools/playback.ts";
 import { ValidationError } from "../src/validate.ts";
 
 /**
@@ -18,7 +18,7 @@ interface Exec {
   seq: number | null;
   /** Data pool of the assigned sequence (default 1, the current one). */
   pool?: number;
-  other?: { class: string; index: number; name: string };
+  other?: { class: string; index: number; name: string; addr?: string };
   props: Record<string, string>;
 }
 interface Seq {
@@ -64,7 +64,15 @@ class Console {
   }
   exec(p: number, e: number, seq: number | null, props: Record<string, string> = {}, pool = 1): this {
     this.page(p);
-    this.pages.get(p)!.execs.set(e, { seq, pool, props: { KeyPress: "Go+", KeyUnpress: "", MAKeyPress: "", MAKeyUnpress: "", Fader: "Master", Encoder: "Master", EncoderLeft: "", EncoderRight: "", Fix: "No", Lock: "", StructureLocked: "No", SystemLocked: "No", ...props } });
+    const custom: Record<string, string> = {};
+    for (const prefix of ["Key", "KeyUnpress", "MAKey", "MAKeyUnpress", "EncoderLeft", "EncoderRight", "MAEncoderLeft", "MAEncoderRight"]) {
+      custom[`${prefix}Command`] = "";
+      custom[`${prefix}UseCustomCommand`] = "No";
+      custom[`${prefix}AddExecutor`] = "Yes";
+    }
+    const page = this.pages.get(p);
+    if (!page) throw new Error(`Page ${p} was not created`);
+    page.execs.set(e, { seq, pool, props: { KeyPress: "Go+", KeyUnpress: "", MAKeyPress: "", MAKeyUnpress: "", Fader: "Master", Encoder: "Master", EncoderLeft: "", EncoderRight: "", MAEncoder: "", MAEncoderLeft: "", MAEncoderRight: "", Width: "1", Height: "1", ExecutorConfiguration: "DefaultSequence", Fix: "No", Lock: "", StructureLocked: "No", SystemLocked: "No", ...custom, ...props } });
     return this;
   }
 
@@ -122,9 +130,11 @@ class Console {
         const items = [...this.pages.keys()].map((p) => ({ name: `Page ${p}`, class: "Page", addr: `14.14.1.13.${p}`, index: p, fields: { No: p } }));
         return { total: items.length, offset: 0, count: items.length, items };
       }
-      const m = ref.match(/^14\.14\.1\.13\.(\d+)$/);
+      const m = ref.match(/^(?:14\.14\.1\.13\.|Page )(\d+)$/);
       if (!m) throw new Error(`unexpected children ref ${ref}`);
-      const items = [...this.pages.get(Number(m[1]))!.execs.entries()].map(([e, x]) => ({ name: "x", class: "Executor", fields: { No: e, Object: x.seq === null ? "" : this.seqHandle(x.seq, x.pool) } }));
+      const page = this.pages.get(Number(m[1]));
+      if (!page) throw new Error(`Page ${m[1]} was not created`);
+      const items = [...page.execs.entries()].map(([e, x]) => ({ name: "x", class: "Executor", fields: { No: e, Width: x.props.Width, Height: x.props.Height, Object: x.other ?? (x.seq === null ? "" : this.seqHandle(x.seq, x.pool)) } }));
       return { total: items.length, offset: 0, count: items.length, items };
     });
     h.fake.on("set", (args) => {
@@ -141,13 +151,38 @@ class Console {
           bag.Lock = value === "Yes" ? "UL" : value === "No" ? "" : bag.Lock;
           return;
         }
+        if (/Command$/.test(property) && !/UseCustomCommand$/.test(property)) {
+          bag[property] = value;
+          if (value !== "") {
+            bag[property.replace(/Command$/, "UseCustomCommand")] = "Yes";
+            const encoder = property.match(/^((?:MA)?Encoder)(?:Left|Right)Command$/);
+            if (encoder) bag[encoder[1]] = "";
+          }
+          return;
+        }
+        if (/UseCustomCommand$|AddExecutor$/.test(property)) {
+          if (value === "Yes" || value === "No") bag[property] = value;
+          const encoder = property.match(/^((?:MA)?Encoder)(?:Left|Right)UseCustomCommand$/);
+          if (encoder && value === "Yes") bag[encoder[1]] = "";
+          return;
+        }
+        if (property === "Width" || property === "Height") {
+          bag[property] = value;
+          return;
+        }
         if (property === "Fix" || (bag.WrapAround !== undefined && /^(Yes|No)$/.test(bag[property] ?? ""))) {
           if (value === "Yes" || value === "No") bag[property] = value;
           return;
         }
         const low = value.toLowerCase();
+        if (/^(?:MA)?Encoder$/.test(property) && low !== "empty") {
+          bag[`${property}Left`] = ""; bag[`${property}Right`] = "";
+          bag[`${property}LeftUseCustomCommand`] = "No"; bag[`${property}RightUseCustomCommand`] = "No";
+        }
+        const discrete = property.match(/^((?:MA)?Encoder)(?:Left|Right)$/);
+        if (discrete && low !== "empty") bag[discrete[1]] = "";
         if (low === "empty") bag[property] = "";
-        else if (/Fader|^Encoder$/.test(property) ? CONSOLE_FADER_VALUES.has(low) : CONSOLE_KEY_VALUES.has(low) || property in (this.seqs.values().next().value?.props ?? {})) bag[property] = CANON[low] ?? value;
+        else if (/Fader|^(?:MA)?Encoder$/.test(property) ? CONSOLE_FADER_VALUES.has(low) : CONSOLE_KEY_VALUES.has(low) || property in (this.seqs.values().next().value?.props ?? {})) bag[property] = CANON[low] ?? value;
       };
       if (r.kind === "page") {
         const pg = this.pages.get(r.p)!;
@@ -282,7 +317,7 @@ test("configure_executor preview reports the plan and sends nothing", async () =
   assert.match(result.summary, /Preview only/);
 });
 
-test("configure_executor refuses an empty executor, a missing page and a non-sequence assignment", async () => {
+test("configure_executor refuses an empty executor, a missing page and an unreadable assignment identity", async () => {
   con.exec(1, 203, null);
   const empty = await h.callJson("gma3_configure_executor", { page: 1, executor: 203, key_press: "Temp" });
   assert.equal(empty.isError, true);
@@ -294,7 +329,7 @@ test("configure_executor refuses an empty executor, a missing page and a non-seq
   con.pages.get(1)!.execs.get(204)!.other = { class: "Macro", index: 3, name: "M" };
   const macro = await h.callJson("gma3_configure_executor", { page: 1, executor: 204, key_press: "Go+" });
   assert.equal(macro.isError, true);
-  assert.match(macro.result.summary, /Macro object; only sequence executors/);
+  assert.match(macro.result.summary, /assigned address must be readable/);
   assert.deepEqual(sets(), []);
 });
 
@@ -687,4 +722,366 @@ test("configure_executor watches the playback of the sequence the executor actua
   assert.deepEqual(result.playback, { activeBefore: true, activeAfter: true });
   const playbackReads = h.fake.requests.filter((r) => r.op === "object").map((r) => r.args.ref);
   assert.deepEqual(playbackReads, ["14.14.2.7.5", "14.14.2.7.5"]);
+});
+
+test("custom commands store exact text and explicit flags without executing the command", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", {
+    page: 1, executor: 201,
+    custom_commands: { key_press: { command: 'Label Macro 1 "CaseSensitive"', add_executor: false, enabled: true }, ma_encoder_right: { command: "Off Sequence 7", enabled: true } },
+  });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ['Page 1.201 KeyCommand=Label Macro 1 "CaseSensitive"', "Page 1.201 KeyAddExecutor=No", "Page 1.201 KeyUseCustomCommand=Yes", "Page 1.201 MAEncoderRightCommand=Off Sequence 7", "Page 1.201 MAEncoderRightUseCustomCommand=Yes"]);
+  assert.equal(h.fake.commands.length, 0);
+  const settings = await h.callJson("gma3_executor_settings", { page: 1, executor: 201, references: false });
+  assert.deepEqual(settings.result.executorSettings.custom_commands.key_press, { command: 'Label Macro 1 "CaseSensitive"', enabled: true, add_executor: false });
+});
+
+test("custom commands reject invalid slots and control characters before bridge reads", async () => {
+  for (const custom_commands of [{ fader: { command: "Off Sequence 5" } }, { key_press: {} }, { key_press: { command: "Go+\nOff" } }, { key_press: { command: "Go+\u0000" } }, { key_press: { command: " Go+" } }, { key_press: { command: "Go+ " } }]) {
+    const { isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands });
+    assert.equal(isError, true);
+  }
+  assert.deepEqual(h.fake.requests, []);
+});
+
+test("an uncertain custom command write stops before enabling it and is never resent", async () => {
+  con.silentSets.add("Page 1.201 KeyCommand=Go+ Sequence 7");
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { key_press: { command: "Go+ Sequence 7", enabled: true } } });
+  assert.equal(isError, true);
+  assert.equal(result.outcome, "unknown");
+  assert.deepEqual(sets(), ["Page 1.201 KeyCommand=Go+ Sequence 7"]);
+  assert.ok(result.steps.some((step: { name: string; status: string }) => step.name === "set_custom_commands.key_press.enabled" && step.status === "skipped"));
+});
+
+test("final custom command read-back detects case and whitespace changes after a confirmed set", async () => {
+  for (const actual of ['Label Macro 1 "casename"', 'Label Macro 1 "CaseName" ']) {
+    h.fake.reset();
+    con.install(h);
+    const executor = con.pages.get(1)?.execs.get(201);
+    assert.ok(executor);
+    executor.props.KeyCommand = "";
+    h.fake.on("set", (args) => {
+      if (args.property === "KeyCommand") executor.props.KeyCommand = actual;
+      else executor.props[String(args.property)] = String(args.value);
+      return { value: args.value };
+    });
+    const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { key_press: { command: 'Label Macro 1 "CaseName"', enabled: true } } });
+    assert.equal(isError, true, JSON.stringify(result));
+    assert.equal(result.outcome, "succeeded");
+    assert.equal(result.verification.status, "mismatched");
+    assert.match(result.verification.detail, /expected exact text/);
+  }
+});
+
+test("macro executor functions use the macro list and refuse sequence faders", async () => {
+  con.exec(1, 204, null);
+  const executor = con.pages.get(1)?.execs.get(204);
+  assert.ok(executor);
+  executor.other = { class: "Macro", index: 3, name: "Busk", addr: "14.14.1.8.3" };
+  const changed = await h.callJson("gma3_configure_executor", { page: 1, executor: 204, key_press: "Call", fader: "Empty" });
+  assert.equal(changed.isError, false, JSON.stringify(changed.result));
+  assert.equal(changed.result.verification.status, "matched");
+  const settings = await h.callJson("gma3_executor_settings", { page: 1, executor: 204 });
+  assert.ok(settings.result.allowedFunctions.key_press.includes("Call"));
+  assert.deepEqual(settings.result.allowedFunctions.fader, ["Empty"]);
+  h.fake.reset();
+  con.install(h);
+  const refused = await h.callJson("gma3_configure_executor", { page: 1, executor: 204, fader: "Master" });
+  assert.equal(refused.isError, true);
+  assert.match(refused.result.summary, /not supported for a Macro executor/);
+  assert.deepEqual(sets(), []);
+});
+
+test("MA encoder continuous and discrete modes report and verify their implicit clears", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, ma_encoder: "Rate" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Page 1.201 MAEncoder=Rate"]);
+  assert.deepEqual(result.intended.implicitModeClears, { MAEncoderLeft: "Empty", MAEncoderRight: "Empty", MAEncoderLeftUseCustomCommand: "No", MAEncoderRightUseCustomCommand: "No" });
+  const discrete = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, ma_encoder_left: "Go-", ma_encoder_right: "Go+" });
+  assert.equal(discrete.isError, false, JSON.stringify(discrete.result));
+  assert.equal(discrete.result.verification.status, "matched");
+  assert.deepEqual(discrete.result.intended.implicitModeClears, { MAEncoder: "Empty" });
+  assert.equal(discrete.result.resulting.MAEncoder, "");
+});
+
+test("incompatible MA encoder modes are refused before bridge reads", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, ma_encoder: "Speed", ma_encoder_left: "Go-" });
+  assert.equal(isError, true);
+  assert.match(result.validationErrors.join(" "), /mutually exclusive/);
+  assert.deepEqual(h.fake.requests, []);
+});
+
+test("command text requires an explicit enabled flag and false is written after the console auto-enables", async () => {
+  const refused = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { key_press: { command: "Echo Test" } } });
+  assert.equal(refused.isError, true);
+  assert.deepEqual(h.fake.requests, []);
+  const disabled = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { key_press: { command: "Echo Test", enabled: false } } });
+  assert.equal(disabled.isError, false, JSON.stringify(disabled.result));
+  assert.equal(disabled.result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Page 1.201 KeyCommand=Echo Test", "Page 1.201 KeyUseCustomCommand=No"]);
+});
+
+test("literal custom command Empty is preserved rather than normalized as an empty function", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { key_press: { command: "Empty", enabled: false } } });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.equal(result.verification.expected.KeyCommand, "Empty");
+  assert.equal(result.resulting.KeyCommand, "Empty");
+  assert.deepEqual(sets(), ["Page 1.201 KeyCommand=Empty", "Page 1.201 KeyUseCustomCommand=No"]);
+});
+
+test("enabled encoder custom commands choose discrete mode and continuous mode clears their flags", async () => {
+  const discrete = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { encoder_left: { command: "Echo Test", enabled: true } } });
+  assert.equal(discrete.isError, false, JSON.stringify(discrete.result));
+  assert.equal(discrete.result.resulting.Encoder, "");
+  const continuous = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, encoder: "Speed" });
+  assert.equal(continuous.isError, false, JSON.stringify(continuous.result));
+  assert.equal(continuous.result.resulting.EncoderLeftUseCustomCommand, "No");
+  assert.equal(continuous.result.verification.status, "matched");
+});
+
+test("disabled encoder command text refuses an active continuous mode before any write", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, custom_commands: { encoder_left: { command: "Echo Test", enabled: false } } });
+  assert.equal(isError, true);
+  assert.match(result.summary, /clear the existing continuous mode/);
+  assert.deepEqual(sets(), []);
+});
+
+test("changing a fallback function warns when its custom command remains enabled", async () => {
+  const executor = con.pages.get(1)?.execs.get(201);
+  assert.ok(executor);
+  executor.props.KeyUseCustomCommand = "Yes";
+  executor.props.KeyCommand = "Echo Test";
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, key_press: "Off" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.ok(result.warnings.some((warning: string) => /fallback function.*custom command is enabled/.test(warning)));
+  assert.deepEqual(sets(), ["Page 1.201 KeyPress=Off"]);
+});
+
+test("executor footprint follows numbered rows and refuses unsupported boundaries", () => {
+  assert.deepEqual(executorFootprint(201, 2, 2), [201, 202, 301, 302]);
+  assert.deepEqual(executorFootprint(209, 5, 1), [209, 210, 211, 212, 213]);
+  for (const [executor, width, height] of [[401, 1, 2], [191, 2, 1], [290, 2, 1], [201, 0, 1]]) assert.throws(() => executorFootprint(executor, width, height), ValidationError);
+});
+
+test("resize refuses occupied cells and sends no property changes", async () => {
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, width: 2, key_press: "Flash" });
+  assert.equal(isError, true);
+  assert.match(result.summary, /overlaps occupied cells: Page 1\.202/);
+  assert.deepEqual(sets(), []);
+});
+
+test("resize checks a neighbouring expanded footprint even when its anchor is outside the new cells", async () => {
+  con.exec(1, 102, 7, { Height: "2" });
+  const page = con.pages.get(1);
+  assert.ok(page);
+  page.execs.delete(202);
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, width: 2 });
+  assert.equal(isError, true);
+  assert.match(result.summary, /Page 1\.202/);
+  assert.deepEqual(sets(), []);
+});
+
+test("resize shrinks first, then grows, and reads both dimensions back", async () => {
+  const executor = con.pages.get(1)?.execs.get(201);
+  const page = con.pages.get(1);
+  assert.ok(executor);
+  assert.ok(page);
+  executor.props.Height = "2";
+  page.execs.delete(202);
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, width: 2, height: 1 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Page 1.201 Height=1", "Page 1.201 Width=2"]);
+});
+
+test("resize refuses a truncated or unreadable occupancy scan", async () => {
+  h.fake.on("children", () => ({ total: 501, items: [] }));
+  const truncated = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, height: 2 });
+  assert.equal(truncated.isError, true);
+  assert.match(truncated.result.summary, /truncated/);
+  h.fake.on("children", () => ({ total: 1, items: [{ class: "Executor", fields: { No: 301 } }] }));
+  const unreadable = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, height: 2 });
+  assert.equal(unreadable.isError, true);
+  assert.match(unreadable.result.summary, /size of Page 1\.301 could not be read/);
+  assert.deepEqual(sets(), []);
+});
+
+test("resize uses proxy No rather than index and ignores only its own covered cells", async () => {
+  const executor = con.pages.get(1)?.execs.get(201);
+  assert.ok(executor);
+  executor.props.Height = "2";
+  h.fake.on("children", () => ({ total: 2, items: [{ class: "Executor", fields: { No: 201, Width: 1, Height: 2 } }, { class: "Proxy", index: 201, fields: { No: 301 } }] }));
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, height: 3 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.deepEqual(sets(), ["Page 1.201 Height=3"]);
+});
+
+test("executor configuration scopes page reads and writes to data_pool and watches the assigned address", async () => {
+  const addr = "14.14.2.7.5";
+  let key = "Go+";
+  h.fake.on("objects", (args) => {
+    if (args.ref === "DataPool 2 Page 1") return { items: [{ class: "Page", fields: { Lock: "" } }] };
+    if (args.ref === "DataPool 2 Page 1.201") return { items: [{ class: "Executor", fields: { Object: { class: "Sequence", addr, index: 5, name: "Other Pool" }, KeyPress: key, KeyUseCustomCommand: "No", Lock: "", StructureLocked: "No", SystemLocked: "No" } }] };
+    throw new Error(`unexpected objects reference ${String(args.ref)}`);
+  });
+  h.fake.on("object", (args) => {
+    assert.equal(args.ref, addr);
+    return { hasActivePlayback: false };
+  });
+  h.fake.on("set", (args) => {
+    assert.equal(args.ref, "DataPool 2 Page 1.201");
+    assert.equal(args.property, "KeyPress");
+    key = String(args.value);
+    return { value: key };
+  });
+  const { result, isError } = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, data_pool: 2, key_press: "Temp" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.target.data_pool, 2);
+  assert.equal(result.verification.status, "matched");
+  assert.equal(h.fake.commands.length, 0);
+});
+
+function configurationWorld() {
+  const configuration = { class: "Configuration", index: 970, name: "Busk Profile", addr: "14.14.1.12.970" };
+  const main = { pool: 1, page: 1, executor: 201, width: 2, height: 2, key: "Go+", configurationAddr: configuration.addr };
+  const external = { pool: 2, page: 1, executor: 205, width: 1, height: 1, key: "Go+", configurationAddr: configuration.addr };
+  const state = { main, external, includeExternal: false, missingReadback: false, pageLocked: false, incomplete: false, commands: 0, feedback: "OK" };
+  const selected = () => state.includeExternal ? [main, external] : [main];
+  const object = (item: typeof main) => ({ class: "Sequence", index: 5, addr: `14.14.${item.pool}.7.5`, name: "Chase" });
+  const fields = (item: typeof main) => ({ Object: object(item), No: item.executor, Width: item.width, Height: item.height, KeyPress: item.key, ExecutorConfiguration: { ...configuration, addr: item.configurationAddr }, Lock: "", StructureLocked: false, SystemLocked: false });
+  h.fake.on("objects", (args) => {
+    const ref = String(args.ref);
+    if (ref === "Configuration 970") return { items: [{ ...configuration, fields: { Width: 1, Height: 1 } }] };
+    const page = ref.match(/^(?:DataPool (\d+) )?Page 1$/);
+    if (page) return { items: [{ class: "Page", fields: { Lock: state.pageLocked ? "UL" : "" } }] };
+    const match = ref.match(/^(?:DataPool (\d+) )?Page 1\.(\d+)$/);
+    if (match) {
+      const item = selected().find((entry) => entry.pool === Number(match[1] ?? 1) && entry.executor === Number(match[2]));
+      if (state.missingReadback && state.commands > 0) return { items: [] };
+      return { items: item ? [{ class: "Executor", fields: fields(item) }] : [] };
+    }
+    throw new Error(`unexpected configuration object ref ${ref}`);
+  });
+  h.fake.on("children", (args) => {
+    const ref = String(args.ref);
+    if (ref === "ShowData.DataPools") return { total: state.incomplete ? 65 : 2, items: [{ fields: { No: 1 } }, { fields: { No: 2 } }] };
+    const pool = ref.match(/^DataPool (\d+)$/);
+    if (pool) return { total: 1, items: [{ name: "Pages", addr: `14.14.${pool[1]}.13` }] };
+    const pages = ref.match(/^14\.14\.(\d+)\.13$/);
+    if (pages) return { total: 1, items: [{ fields: { No: 1 }, addr: `14.14.${pages[1]}.13.1` }] };
+    const page = ref.match(/^14\.14\.(\d+)\.13\.1$/);
+    if (page || ref === "Page 1") {
+      const items = selected().filter((item) => item.pool === Number(page?.[1] ?? 1)).map((item) => ({ class: "Executor", fields: fields(item) }));
+      return { total: items.length, items };
+    }
+    throw new Error(`unexpected configuration children ref ${ref}`);
+  });
+  h.fake.on("cmd", (args) => {
+    state.commands++;
+    if (state.feedback === "OK") {
+      if (args.command === "Assign Configuration 970 At Page 1.201") { main.width = 1; main.height = 1; main.key = ""; main.configurationAddr = configuration.addr; }
+      else if (args.command === "Recast Configuration 970") for (const item of selected()) item.key = "";
+      else throw new Error(`unexpected configuration command ${String(args.command)}`);
+    }
+    return { feedback: state.feedback };
+  });
+  return state;
+}
+
+test("configuration load checks size and verifies identity, unchanged object and dimensions with its profile limitation", async () => {
+  const state = configurationWorld();
+  state.main.configurationAddr = "14.14.1.12.1";
+  const { result, isError } = await h.callJson("gma3_executor_configuration", { action: "load", configuration: 970, page: 1, executor: 201 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched");
+  assert.match(result.profileVerification, /unavailable/);
+  assert.equal(result.resulting[0].functions.key_press, "Empty");
+  assert.deepEqual(h.fake.commands, ["Assign Configuration 970 At Page 1.201"]);
+});
+
+test("configuration recast plans references across data pools and needs an exact apply list", async () => {
+  const state = configurationWorld();
+  state.includeExternal = true;
+  const plan = await h.callJson("gma3_executor_configuration", { action: "recast", configuration: 970 });
+  assert.equal(plan.isError, false, JSON.stringify(plan.result));
+  assert.deepEqual(plan.result.affectedExecutors.map((item: { ref: string }) => item.ref), ["DataPool 1 Page 1.201", "DataPool 2 Page 1.205"]);
+  assert.deepEqual(h.fake.commands, []);
+  const refused = await h.callJson("gma3_executor_configuration", { action: "recast", configuration: 970, apply: true, executors: [{ data_pool: 1, page: 1, executor: 201 }] });
+  assert.equal(refused.isError, true);
+  assert.deepEqual(h.fake.commands, []);
+  const applied = await h.callJson("gma3_executor_configuration", { action: "recast", configuration: 970, apply: true, executors: [{ data_pool: 1, page: 1, executor: 201 }, { data_pool: 2, page: 1, executor: 205 }] });
+  assert.equal(applied.isError, false, JSON.stringify(applied.result));
+  assert.equal(applied.result.verification.status, "matched");
+  assert.equal(state.main.width, 2);
+  assert.equal(state.main.height, 2);
+  assert.equal(state.main.key, "");
+  assert.equal(state.external.key, "");
+  assert.deepEqual(h.fake.commands, ["Recast Configuration 970"]);
+});
+
+test("configuration load refuses locks and recast refuses an incomplete data-pool scan", async () => {
+  const state = configurationWorld();
+  state.pageLocked = true;
+  const locked = await h.callJson("gma3_executor_configuration", { action: "load", configuration: 970, page: 1, executor: 201 });
+  assert.equal(locked.isError, true);
+  assert.match(locked.result.summary, /locked/);
+  state.pageLocked = false;
+  state.incomplete = true;
+  const incomplete = await h.callJson("gma3_executor_configuration", { action: "recast", configuration: 970 });
+  assert.equal(incomplete.isError, true);
+  assert.match(incomplete.result.summary, /complete affected executor list/);
+  assert.deepEqual(h.fake.commands, []);
+});
+
+test("configuration read-back loss preserves command outcome without resending or claiming verification", async () => {
+  const state = configurationWorld();
+  state.missingReadback = true;
+  const { result, isError } = await h.callJson("gma3_executor_configuration", { action: "load", configuration: 970, page: 1, executor: 201 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.outcome, "succeeded");
+  assert.equal(result.verification.status, "unavailable");
+  assert.equal(h.fake.commands.length, 1);
+});
+
+test("occupancy enumeration errors, invalid entries and field errors refuse every mutation", async () => {
+  for (const listing of [
+    { total: 0, items: [], enumerationError: "Children failed" },
+    { total: 1, items: [{ class: "Executor", invalid: true, fields: { No: 301, Width: 1, Height: 1 } }] },
+    { total: 1, items: [{ class: "Executor", fieldErrors: { Width: "Get failed" }, fields: { No: 301, Width: 1, Height: 1 } }] },
+    { total: -1, items: [] },
+  ]) {
+    h.fake.on("children", () => listing);
+    const result = await h.callJson("gma3_configure_executor", { page: 1, executor: 201, height: 2, key_press: "Flash" });
+    assert.equal(result.isError, true, JSON.stringify(result.result));
+  }
+  assert.deepEqual(sets(), []);
+  assert.deepEqual(h.fake.commands, []);
+});
+
+test("recast refuses failed executor enumeration even when another page looks healthy", async () => {
+  const state = configurationWorld();
+  h.fake.on("children", (args) => {
+    if (args.ref === "ShowData.DataPools") return { total: 1, items: [{ fields: { No: 1 } }] };
+    if (args.ref === "DataPool 1") return { total: 1, items: [{ name: "Pages", addr: "14.14.1.13" }] };
+    if (args.ref === "14.14.1.13") return { total: 2, items: [{ fields: { No: 1 }, addr: "14.14.1.13.1" }, { fields: { No: 2 }, addr: "14.14.1.13.2" }] };
+    if (args.ref === "14.14.1.13.1") return { total: 1, items: [{ class: "Executor", fields: { No: 201, ExecutorConfiguration: { addr: state.main.configurationAddr } } }] };
+    return { total: 0, items: [], enumerationError: "Children failed" };
+  });
+  const { result, isError } = await h.callJson("gma3_executor_configuration", { action: "recast", configuration: 970, apply: true, executors: [{ data_pool: 1, page: 1, executor: 201 }] });
+  assert.equal(isError, true, JSON.stringify(result));
+  assert.match(result.summary, /complete affected executor list/);
+  assert.deepEqual(h.fake.commands, []);
+});
+
+test("configuration load refuses a failed occupancy enumeration without dispatching Assign", async () => {
+  configurationWorld();
+  h.fake.on("children", () => ({ total: 0, items: [], enumerationError: "Children failed" }));
+  const { isError } = await h.callJson("gma3_executor_configuration", { action: "load", configuration: 970, page: 1, executor: 201 });
+  assert.equal(isError, true);
+  assert.deepEqual(h.fake.commands, []);
 });

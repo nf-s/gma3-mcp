@@ -24,6 +24,8 @@ test("scopeText writes DataPool n before every data-pool object keyword outside 
   assert.equal(scopeText("Group 3 + Group 4; Preset 4.2 Thru 4.5", 2, true), "SelFix DataPool 2 Group 3 + DataPool 2 Group 4; At DataPool 2 Preset 4.2 Thru 4.5");
   assert.equal(scopeText('Label Macro 7 "Sequence 1"', 2), 'Label DataPool 2 Macro 7 "Sequence 1"', "quoted text is kept");
   assert.equal(scopeText("DataPool 4 Sequence 1", 2), "DataPool 4 Sequence 1", "an explicit data pool is kept");
+  assert.equal(scopeText("Assign Configuration 970 At Page 91.201", 2, true), "Assign DataPool 2 Configuration 970 At DataPool 2 Page 91.201");
+  assert.equal(scopeText("Recast DataPool 4 Configuration 970", 2, true), "Recast DataPool 4 Configuration 970", "explicit configuration ownership is retained");
   assert.equal(scopeText("Fixture 1 Thru 5 At 50", 2), "Fixture 1 Thru 5 At 50", "fixtures do not live in a data pool");
   // Checked on onPC: a statement may not start with "DataPool n Group m" or "DataPool n Preset p".
   assert.equal(scopeText("Group 9901", 1, true), "SelFix DataPool 1 Group 9901");

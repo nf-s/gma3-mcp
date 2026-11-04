@@ -46,6 +46,7 @@ import {
   type Verification,
 } from "../results.js";
 import { ValidationError, Validator, finiteNumber, objectName, objectNumber } from "../validate.js";
+import { dataPoolOf, dataPoolShape, inDataPool } from "./datapool.js";
 
 // ---------------------------------------------------------------------------
 // Module-local validation
@@ -72,6 +73,17 @@ export function pageNumber(field: string, value: unknown): number {
 }
 
 export const executorRef = (page: number, executor: number): string => `Page ${page}.${executor}`;
+
+/** A single qualified pool object, never a range or a command fragment. */
+export function executorObjectReference(field: string, value: unknown): string {
+  const parsed = z.string().trim().regex(/^(?:DataPool\s+[1-9]\d*\s+)?(?:Sequence|Macro)\s+[1-9]\d*$/i).safeParse(value);
+  if (!parsed.success) throw new ValidationError(`${field} must name one Sequence or Macro by number, optionally qualified with DataPool <n>`, field);
+  const match = parsed.data.match(/^(?:DataPool\s+(\d+)\s+)?(Sequence|Macro)\s+(\d+)$/i);
+  if (!match) throw new ValidationError(`${field} could not be resolved`, field);
+  const pool = match[1] === undefined ? undefined : objectNumber(`${field}.data_pool`, Number(match[1]), { max: 9999 });
+  const number = objectNumber(field, Number(match[3]));
+  return `${pool === undefined ? "" : `DataPool ${pool} `}${match[2].toLowerCase() === "sequence" ? "Sequence" : "Macro"} ${number}`;
+}
 
 // ---------------------------------------------------------------------------
 // Read-only inspection (objects op, asText=false so handles keep class and address)
@@ -103,6 +115,10 @@ function inspectStep(bridge: Gma3Bridge, name: string, ref: string, fields: stri
     try {
       const res = await readObjects(bridge, ref, fields, 1, { asText: false });
       const item = res?.items?.[0];
+      if (item?.fieldErrors !== undefined) {
+        const errors = z.record(z.string(), z.unknown()).safeParse(item.fieldErrors);
+        if (!errors.success || Object.keys(errors.data).length) return asRead({ name, status: "failed", op: "objects", error: `requested fields of ${ref} could not be read without errors`, detail: item.fieldErrors });
+      }
       return asRead(interpret(!item || item.invalid ? null : item));
     } catch (err) {
       return asRead(stepFromError(name, err, { op: "objects", detail: { ref, fields } }));
@@ -114,7 +130,9 @@ function toAssigned(value: unknown): AssignedObject | null {
   if (value === null || value === undefined) return null;
   if (typeof value === "string") return value.trim() === "" ? null : { name: value };
   if (typeof value === "object") {
-    const v = value as Record<string, unknown>;
+    const parsed = z.object({ name: z.string().optional(), class: z.string().optional(), addr: z.string().optional(), index: z.number().optional() }).safeParse(value);
+    if (!parsed.success) return null;
+    const v = parsed.data;
     const out: AssignedObject = {};
     if (typeof v.name === "string") out.name = v.name;
     if (typeof v.class === "string") out.class = v.class;
@@ -138,8 +156,7 @@ function executorState(item: ObjectSummary | null): ExecutorState {
 function isSameObject(assigned: AssignedObject | null | undefined, seq: AssignedObject): boolean {
   if (!assigned) return false;
   if (assigned.addr && seq.addr) return assigned.addr === seq.addr;
-  if (assigned.class && assigned.index !== undefined && seq.index !== undefined) return assigned.class === "Sequence" && assigned.index === seq.index;
-  return assigned.name !== undefined && seq.name !== undefined && assigned.name === seq.name;
+  return false;
 }
 
 function describeAssigned(a: AssignedObject | null | undefined): string {
@@ -213,7 +230,7 @@ function finalize(o: {
 async function readBack(
   bridge: Gma3Bridge,
   ref: string,
-  expected: { objectName: string; objectClass?: string; label?: string },
+  expected: { objectName: string; objectClass?: string; objectAddr?: string; label?: string },
   objectRef: string | null,
 ): Promise<{ steps: StepResult[]; resulting: ExecutorState | null; objectName: string | null; verification: Verification }> {
   let resulting: ExecutorState | null = null;
@@ -246,6 +263,7 @@ async function readBack(
   const r: ExecutorState = resulting;
   const want: Record<string, unknown> = { object: expected.objectName };
   if (expected.objectClass) want.objectClass = expected.objectClass;
+  if (expected.objectAddr) want.objectAddr = expected.objectAddr;
   if (expected.label !== undefined) {
     want.name = expected.label;
     if (objectRef) want.assignedObjectName = expected.label;
@@ -266,9 +284,10 @@ async function readBack(
 // ---------------------------------------------------------------------------
 
 interface AssignArgs {
-  sequence: number;
-  page: number;
-  executor: number;
+  sequence?: number;
+  object?: string;
+  page?: number;
+  executor?: number;
   replace?: boolean;
   label?: string;
   verify?: boolean;
@@ -277,20 +296,24 @@ interface AssignArgs {
 export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promise<OperationResult> {
   const op = "assign_to_executor";
   const v = new Validator();
-  const sequence = v.check(() => objectNumber("sequence", raw.sequence));
+  if ((raw.sequence === undefined) === (raw.object === undefined)) v.errors.push("give exactly one of sequence or object");
+  const sequence = raw.sequence === undefined ? undefined : v.check(() => objectNumber("sequence", raw.sequence));
+  const sourceRef = raw.object === undefined ? sequence === undefined ? undefined : `Sequence ${sequence}` : v.check(() => executorObjectReference("object", raw.object));
   const page = v.check(() => pageNumber("page", raw.page));
   const executor = v.check(() => executorNumber("executor", raw.executor));
   const label = v.check(() => objectName("label", raw.label, { optional: true }));
   const replace = raw.replace === true;
   const verify = raw.verify !== false;
-  const target: Record<string, unknown> = { sequence: raw.sequence, page: raw.page, executor: raw.executor };
-  if (!v.ok || sequence === undefined || page === undefined || executor === undefined) return validationFailure(op, target, v.errors);
+  const target: Record<string, unknown> = { ...(raw.object === undefined ? { sequence: raw.sequence } : { object: raw.object }), page: raw.page, executor: raw.executor };
+  if (dataPoolOf(ctx.bridge) !== undefined) target.data_pool = dataPoolOf(ctx.bridge);
+  if (!v.ok || sourceRef === undefined || page === undefined || executor === undefined) return validationFailure(op, target, v.errors);
 
   const ref = executorRef(page, executor);
   target.executorRef = ref;
   const t = ctx.requestTimeoutMs;
   const bridge = ctx.bridge;
-  const command = `Assign Sequence ${sequence} At ${ref}`;
+  const command = `Assign ${sourceRef} At ${ref}`;
+  const checkSource = raw.object === undefined ? "check_sequence" : "check_object";
   const plannedMutations = ["assign", ...(label !== undefined ? ["label"] : [])];
   const plannedReads = verify ? ["read_back", ...(label !== undefined ? ["read_back_object"] : [])] : [];
 
@@ -301,12 +324,15 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
     // Phase 1: read-only inspection. Nothing is sent to the console if any of these fail.
     const inspect = await runSteps([
       {
-        name: "check_sequence",
-        run: inspectStep(bridge, "check_sequence", `Sequence ${sequence}`, ["Name"], (item) => {
-          if (!item) return { name: "check_sequence", status: "failed", op: "objects", error: `Sequence ${sequence} does not exist` };
+        name: checkSource,
+        run: inspectStep(bridge, checkSource, sourceRef, ["Name"], (item) => {
+          if (!item) return { name: checkSource, status: "failed", op: "objects", error: `${sourceRef} does not exist` };
+          if (!item.addr) return { name: checkSource, status: "failed", op: "objects", error: `${sourceRef} has no readable address; assignment identity cannot be checked` };
+          const sourceClass = /(?:^|\s)Macro\s/i.test(sourceRef) ? "Macro" : "Sequence";
+          if (item.class !== sourceClass) return { name: checkSource, status: "failed", op: "objects", error: `${sourceRef} resolved to ${item.class ?? "an unreadable class"}, expected ${sourceClass}` };
           const nameField = item.fields?.Name;
           seq = { name: typeof nameField === "string" ? nameField : item.name, class: item.class ?? "Sequence", addr: item.addr, index: item.index };
-          return { name: "check_sequence", status: "succeeded", op: "objects", detail: seq };
+          return { name: checkSource, status: "succeeded", op: "objects", detail: seq };
         }),
       },
       {
@@ -321,6 +347,7 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
       {
         name: "inspect_executor",
         run: inspectStep(bridge, "inspect_executor", ref, ["Object", "Name"], (item) => {
+          if (item?.class === "Proxy") return { name: "inspect_executor", status: "failed", op: "objects", error: `${ref} is covered by an expanded executor; assign to its owning executor instead` };
           previous = executorState(item);
           return { name: "inspect_executor", status: "succeeded", op: "objects", detail: previous };
         }),
@@ -369,7 +396,7 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
     const labelled = mutation.steps.some((s) => s.name === "label" && s.status !== "skipped");
     const warnings: string[] = [];
     if (occupiedByOther) warnings.push(`replaced ${describeAssigned(previous.object)} on ${ref}`);
-    if (labelled) warnings.push(`the label renames Sequence ${sequence} itself (an executor shows its assigned object's name); the new name appears everywhere the sequence does`);
+    if (labelled) warnings.push(`the label renames ${sourceRef} itself (an executor shows its assigned object's name); the new name appears everywhere that object does`);
 
     // Phase 3: read-back whenever something may have changed (or for a verified no-op).
     let verification: Verification = verify ? unavailable("read-back was not reached") : notRequested();
@@ -379,7 +406,7 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
     const readBackSteps: StepResult[] = [];
     if (verify) {
       // If the label step did not run, the sequence should still carry its old name.
-      const rb = await readBack(bridge, ref, { objectName: labelled ? label! : seq.name ?? "", objectClass: "Sequence", label: labelled ? label : undefined }, `Sequence ${sequence}`);
+      const rb = await readBack(bridge, ref, { objectName: labelled && label !== undefined ? label : seq.name ?? "", objectClass: seq.class, objectAddr: seq.addr, label: labelled ? label : undefined }, sourceRef);
       readBackSteps.push(...rb.steps);
       verification = rb.verification;
       resulting = rb.resulting;
@@ -389,9 +416,9 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
 
     let summary: string | undefined;
     if (alreadyAssigned && !mutated) {
-      summary = `Sequence ${sequence} (${JSON.stringify(seq.name)}) is already assigned to ${ref}; no command was sent.${verification.status === "matched" ? " Read-back matched." : verification.status === "mismatched" ? ` Read-back MISMATCHED: ${verification.detail}` : ""}`;
+      summary = `${sourceRef} (${JSON.stringify(seq.name)}) is already assigned to ${ref}; no command was sent.${verification.status === "matched" ? " Read-back matched." : verification.status === "mismatched" ? ` Read-back MISMATCHED: ${verification.detail}` : ""}`;
     } else if (alreadyAssigned && mutation.outcome === "succeeded" && verification.status !== "mismatched") {
-      summary = `Sequence ${sequence} was already assigned to ${ref}; only the label was applied (renaming the sequence).${verification.status === "matched" ? " Read-back matched." : ""}`;
+      summary = `${sourceRef} was already assigned to ${ref}; only the label was applied (renaming the assigned object).${verification.status === "matched" ? " Read-back matched." : ""}`;
     }
 
     return finalize({
@@ -411,6 +438,8 @@ export async function assignToExecutor(ctx: ToolContext, raw: AssignArgs): Promi
         replaced: occupiedByOther && mutated,
         command: alreadyAssigned ? null : command,
         sequenceName: seq.name,
+        sourceRef,
+        sourceObject: seq,
         ...(label !== undefined ? { sequenceNameAfter } : {}),
       },
     });
@@ -436,6 +465,7 @@ export async function labelExecutor(ctx: ToolContext, raw: LabelArgs): Promise<O
   const label = v.check(() => objectName("label", raw.label));
   const verify = raw.verify !== false;
   const target: Record<string, unknown> = { page: raw.page, executor: raw.executor, label: raw.label };
+  if (dataPoolOf(ctx.bridge) !== undefined) target.data_pool = dataPoolOf(ctx.bridge);
   if (!v.ok || page === undefined || executor === undefined || label === undefined) return validationFailure(op, target, v.errors);
 
   const ref = executorRef(page, executor);
@@ -491,7 +521,7 @@ export async function labelExecutor(ctx: ToolContext, raw: LabelArgs): Promise<O
 
     const readBackSteps: StepResult[] = [];
     if (verify) {
-      const rb = await readBack(bridge, ref, { objectName: label, objectClass: previous.object?.class, label }, objectRef);
+      const rb = await readBack(bridge, ref, { objectName: label, objectClass: previous.object?.class, objectAddr: previous.object?.addr, label }, previous.object?.addr ?? objectRef);
       readBackSteps.push(...rb.steps);
       verification = rb.verification;
       resulting = rb.resulting;
@@ -511,7 +541,7 @@ export async function labelExecutor(ctx: ToolContext, raw: LabelArgs): Promise<O
       noop: false,
       readBackSteps,
       warnings,
-      extra: { previous, resulting, assignedObjectRef: objectRef, assignedObjectName },
+      extra: { previous, resulting, assignedObjectRef: objectRef, assignedObjectAddr: previous.object?.addr, assignedObjectName },
     });
   });
 }
@@ -522,33 +552,39 @@ export async function labelExecutor(ctx: ToolContext, raw: LabelArgs): Promise<O
 
 const EXECUTOR_DESC = "Executor number on that page: 101-190 (keys), 201-290 (faders), 301-390 and 401-490 (knobs), plus the Xkeys 191-198 and 291-298.";
 const NAME_DESC = "Names must not contain \\ \" $ & * ? , . ; ^ { } | ~ (the console strips them); leading/trailing spaces are trimmed.";
+const assignArgumentSchema = z.object({
+  sequence: z.number().optional(), object: z.string().optional(), page: z.number().optional(), executor: z.number().optional(),
+  replace: z.boolean().optional(), label: z.string().optional(), verify: z.boolean().optional(),
+});
 
 export const registerExecutorTools: RegisterTools = (server, ctx) => {
   server.registerTool(
     "gma3_assign_to_executor",
     {
-      title: "Assign a sequence to an executor",
+      title: "Assign an object to an executor",
       description:
-        "Assign a sequence to an executor on an explicit page: sends 'Assign Sequence <n> At Page <p>.<e>' (manual syntax). " +
+        "Assign a sequence or macro to an executor on an explicit page: give sequence for compatibility or object (Sequence <n>, Macro <n>, optionally DataPool <n>). Sends 'Assign <object> At Page <p>.<e>'. " +
         "Before sending anything it checks read-only that the sequence and the page exist and what the executor currently holds; " +
         "an executor holding a different object is only replaced with replace: true (otherwise the call fails with the previous assignment in the result), " +
         "and an executor that already holds this sequence is left alone (alreadyAssigned: true, no command sent). " +
-        "Optional label: sends 'Label Page <p>.<e> \"<label>\"' after assigning. On grandMA3 an executor has no label of its own: it shows its assigned object's name, so this RENAMES THE SEQUENCE itself, everywhere it appears (pools, other executors). " +
+        "Optional label: sends 'Label Page <p>.<e> \"<label>\"' after assigning. On grandMA3 an executor has no label of its own: it shows its assigned object's name, so this RENAMES THE ASSIGNED OBJECT itself, everywhere it appears (pools, other executors). " +
         "If labelling fails after the assignment the outcome is partial. " +
         "Does not change the fixture selection or the programmer and never sends Go/On/Off/Toggle or any playback keyword; whether the console changes the selected sequence on assignment is not controlled by this tool. " +
-        "verify (default true) reads the executor back and compares the assigned object (by name and class) and, when a label was given, the executor's displayed name and the sequence's own Name; executor configuration, fader/key functions and playback state are NOT verified. " +
+        "verify (default true) reads the executor back and compares the assigned object by address, name and class and, when a label was given, the executor's displayed name and the object's own Name; executor configuration, fader/key functions and playback state are NOT verified. " +
         "Mutations from this server are serialised, but another operator or client can still change the executor between the inspection and the assignment. " +
         "Batch form (assignments): each target executor is checked to be empty or to hold that sequence already, unless replace is given for that item (or for the whole call); a target listed twice is refused. " +
         BATCH_NOTE,
       inputSchema: {
-        sequence: z.number().optional().describe("Sequence number to assign (must exist). Required unless assignments is given."),
+        ...dataPoolShape,
+        sequence: z.number().optional().describe("Sequence number to assign (must exist). Give sequence or object; omit single-source fields with assignments."),
+        object: z.string().optional().describe("One Sequence or Macro reference by number, optionally DataPool <n> qualified. Give object or sequence, never both. Must exist."),
         page: z.number().optional().describe("Executor page number (1-9999). The page must already exist; the tool does not create pages. Required unless assignments is given (it may then be a default for every item)."),
         executor: z.number().optional().describe(`${EXECUTOR_DESC} Required unless assignments is given.`),
         replace: z.boolean().optional().describe("Replace an executor that holds a different object (default false: fail and report the previous assignment)."),
         label: z.string().optional().describe(`Optional new name for the assigned sequence (an executor displays its assigned object's name). ${NAME_DESC}`),
         verify: z.boolean().optional().describe("Read the executor (and the sequence, when labelled) back and compare (default true)."),
         assignments: z
-          .array(z.object({ sequence: z.number(), page: z.number().optional(), executor: z.number(), replace: z.boolean().optional(), label: z.string().optional() }))
+          .array(z.object({ sequence: z.number().optional(), object: z.string().optional(), page: z.number().optional(), executor: z.number(), replace: z.boolean().optional(), label: z.string().optional() }))
           .optional()
           .describe("Batch form: several assignments, each {sequence, page, executor, replace, label}; page may be given once for all."),
         ...batchOptionShape,
@@ -556,18 +592,18 @@ export const registerExecutorTools: RegisterTools = (server, ctx) => {
     },
     async (args) =>
       operation(() =>
-        (args as Record<string, unknown>).assignments !== undefined
-          ? runBatchCall(args as Record<string, unknown>, {
-              ctx,
+        args.assignments !== undefined
+          ? runBatchCall(args, {
+              ctx: inDataPool(ctx, args),
               operation: "assign_to_executor",
               listKey: "assignments",
-              identityKeys: ["sequence", "executor", "label"],
-              label: (it) => `Sequence ${String(it.sequence)} -> Page ${String(it.page)}.${String(it.executor)}`,
+              identityKeys: ["sequence", "object", "executor", "label"],
+              label: (it) => `${it.object === undefined ? `Sequence ${String(it.sequence)}` : String(it.object)} -> Page ${String(it.page)}.${String(it.executor)}`,
               key: (it) => `Page ${String(it.page)}.${String(it.executor)}`,
               check: (items) => duplicates(items.map((it) => `Page ${String(it.page)}.${String(it.executor)}`)).map((x) => `${x} is a target more than once in assignments`),
-              run: (it, c) => assignToExecutor(c, it as unknown as AssignArgs),
+              run: (it, c) => assignToExecutor(c, assignArgumentSchema.parse(it)),
             })
-          : assignToExecutor(ctx, args as AssignArgs),
+          : assignToExecutor(inDataPool(ctx, args), args),
       ),
   );
 
@@ -582,12 +618,13 @@ export const registerExecutorTools: RegisterTools = (server, ctx) => {
         "verify (default true) reads back the executor's displayed name and assigned object and the assigned object's own Name; nothing else is verified. " +
         "Mutations from this server are serialised, but not isolated from other operators or clients.",
       inputSchema: {
+        ...dataPoolShape,
         page: z.number().describe("Executor page number (1-9999); the page must exist."),
         executor: z.number().describe(EXECUTOR_DESC),
         label: z.string().describe(`The new name for the assigned object. ${NAME_DESC}`),
         verify: z.boolean().optional().describe("Read the executor and its assigned object back and compare (default true)."),
       },
     },
-    async (args) => operation(() => labelExecutor(ctx, args as LabelArgs)),
+    async (args) => operation(() => labelExecutor(inDataPool(ctx, args), args)),
   );
 };

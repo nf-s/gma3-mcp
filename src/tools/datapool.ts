@@ -22,7 +22,7 @@ export const dataPoolShape = {
 };
 
 /** Keywords of objects that live in a data pool; a reference to one is scoped to the chosen data pool. */
-const POOL_KEYWORDS = new Set(["sequence", "macro", "group", "preset", "matricks", "page", "timecode", "world", "filter", "layout", "plugin", "quickey"]);
+const POOL_KEYWORDS = new Set(["sequence", "macro", "group", "preset", "matricks", "page", "timecode", "world", "filter", "layout", "plugin", "quickey", "configuration"]);
 
 /**
  * A statement may not start with "DataPool n Group m" or "DataPool n Preset p" (onPC 2.x: "Illegal object"), so a bare

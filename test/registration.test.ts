@@ -57,6 +57,7 @@ const WORKFLOW_TOOLS = [
   "gma3_delete_cue",
   "gma3_assign_to_executor",
   "gma3_label_executor",
+  "gma3_executor_configuration",
   "gma3_fixture_attributes",
   "gma3_programmer",
   "gma3_fixture_output",

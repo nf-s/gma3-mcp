@@ -53,7 +53,8 @@ Workflow tools (shared result model, see [below](#workflow-tools); details in [`
 | `gma3_build_chase` | A looping chase into an empty sequence (one cue per look or preset, Time triggers, Wrap Around), then plays it and verifies one observed cycle through the wrap ([docs](tools/cuelists.md)) |
 | `gma3_recipes`, `gma3_edit_recipe`, `gma3_cook_recipes` | Read, add, change, move or remove one recipe line of a preset or cue part (references checked, every line read back); cook a preset, part, cue or sequence with an explicit option, verified ([docs](tools/recipes.md)) |
 | `gma3_store_recipe_cues` | The recipe lines of up to 100 cue parts of one sequence in one call (replace or append; group, preset, MAtricks, the per-line MAtricks and fade columns), with the cue's name and note; references checked once up front, a compact read-back per cue (line count and mismatches), an optional cook of every part ([docs](tools/recipes.md#gma3_store_recipe_cues)) |
-| `gma3_assign_to_executor`, `gma3_label_executor` | Inspect, then `Assign Sequence n At Page p.e` (replacing only with `replace`), label, read back ([docs](tools/executors.md)) |
+| `gma3_assign_to_executor`, `gma3_label_executor` | Inspect, assign Sequence or Macro objects (replacing only with `replace`), label and verify addresses; optional explicit data pool ([docs](tools/executors.md)) |
+| `gma3_executor_configuration` | Load an existing configuration after collision checks, or plan/recast across the complete affected executor list; complete profile saving remains unsupported ([docs](tools/playback.md#gma3_executor_configuration)) |
 
 Structured inspection tools (read-only; work with Lua execution disabled; need plugin v0.3.0 or newer, see
 [Updating the plugin](tools/inspection.md#updating-the-plugin-required-once-for-these-tools)):

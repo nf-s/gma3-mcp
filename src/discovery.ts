@@ -20,7 +20,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "phasers (movement and colour effects)", tools: ["gma3_build_phaser", "gma3_phaser_release"] },
   { task: "cues and cue lists", tools: ["gma3_store_cues", "gma3_edit_cues", "gma3_store_cue", "gma3_set_cue_timing", "gma3_set_cue_trigger", "gma3_cue_contents", "gma3_delete_cue"] },
   { task: "chases", tools: ["gma3_build_chase"] },
-  { task: "executors and sequence playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
+  { task: "executors and sequence playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_executor_configuration", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
   { task: "speed masters and tempo", tools: ["gma3_configure_speed_master", "gma3_speed_master_action", "gma3_speed_masters"] },
   { task: "recipes, many cues per call", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_store_recipe_cues", "gma3_cook_recipes"] },
   { task: "macros and their dialogs", tools: ["gma3_store_macro", "gma3_edit_macro_line", "gma3_run_macro", "gma3_macros", "gma3_dialog"] },

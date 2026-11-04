@@ -1,6 +1,6 @@
 # Executor tools (FR-06)
 
-Two workflow tools assign sequences to executors and label executors without hand-built command
+Two workflow tools assign sequences or macros to executors and label executors without hand-built command
 strings. Both run on the existing bridge ops only (`objects` and `cmd`); no Lua was added and
 nothing here needs `gma3_lua`.
 
@@ -44,19 +44,21 @@ every other executor it is assigned to.
   bridge request. Read-only inspection and read-back steps carry `kind: "read"` and never count as
   completed work: a refusal or failure before the first mutation is `failed` (nothing was sent),
   the deliberate no-op "already assigned" is `succeeded`, and a read-back that cannot be
-  performed after a mutation makes the outcome `partial` with verification `unavailable`.
+  performed after a confirmed mutation keeps that execution outcome with verification `unavailable`.
 - **Uncertainty.** A lost reply or unfamiliar console feedback makes the step `unknown`; the
   command is never resent. The read-back still runs after an `unknown` or `partial` mutation so the
   client can see the resulting state; the outcome stays `unknown`/`partial`.
 
 ## gma3_assign_to_executor
 
-Assign a sequence to an executor on an explicit page, optionally labelling (renaming) it in the
-same call.
+Assign a sequence or macro to an executor on an explicit page, optionally labelling (renaming) it in the
+same call. The existing `sequence` form remains supported. Give exactly one of `sequence` and `object`.
 
 | Parameter | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `sequence` | integer >= 1 | yes | Sequence number. Must exist. |
+| `sequence` | integer >= 1 | one source | Sequence number. Must exist; compatible with existing calls. |
+| `object` | string | one source | One numeric `Sequence <n>` or `Macro <n>` reference, optionally qualified with `DataPool <n>`. Ranges, names and command fragments are refused. |
+| `data_pool` | integer 1-9999 | no | Pool containing the target page and any unqualified source. Omit for the current pool. An explicitly qualified source can come from another pool. |
 | `page` | integer 1-9999 | yes | Executor page. Must exist; the tool does not create pages. |
 | `executor` | integer | yes | Executor number on that page (see numbering above). |
 | `replace` | boolean, default `false` | no | Replace an executor that holds a different object. |
@@ -85,10 +87,10 @@ Requests, in order (each is one step in the result):
 6. If `verify`: `objects` `Page <p>.<e>` fields `Object`, `Name` again (`resulting`), and, when the
    label step ran, `objects` `Sequence <n>` fields `Name` (`sequenceNameAfter`).
 
-Verification compares the read-back against `{ object: <expected name>, objectClass: "Sequence" }`
+Verification compares the read-back against the source object’s address, expected name and class
 where the expected name is the label when the label step ran, else the sequence's name before the
 call; with a label it also checks `name` (the executor's displayed name) and `assignedObjectName`
-(the sequence's own Name) against the label. **Not verified:** executor configuration, key / fader
+(the assigned object’s own Name) against the label. **Not verified:** executor configuration, key / fader
 / encoder functions, fader level, playback state, and whether the executor is visible on the
 current page.
 
@@ -97,7 +99,8 @@ Result extras: `previous` and `resulting` (`{ empty, name, object: { name, class
 
 ### Batch form (SU-12)
 
-`assignments: [{sequence, page, executor, replace, label}]` assigns several sequences; `page` (and `replace`, `verify`)
+`assignments: [{sequence, page, executor, replace, label}]` assigns several sequences; an item may instead give
+`object: "Macro <n>"`. Each item requires exactly one source. `page` (and `replace`, `verify`)
 may be given once for all. Each target gets the checks above: an executor holding another object fails that item
 unless it has `replace: true`, and an executor already holding the sequence sends nothing. A target listed twice
 refuses the whole call. See [Batch forms](README.md#batch-forms-su-12).
@@ -111,6 +114,7 @@ Label the object assigned to the executor at `Page <p>.<e>` (renames it; see the
 | `page` | integer 1-9999 | yes | Executor page. Must exist. |
 | `executor` | integer | yes | Executor number on that page. |
 | `label` | string | yes | The new name for the assigned object (see Names above). |
+| `data_pool` | integer 1-9999 | no | Pool containing the target page; omit for the current pool. |
 | `verify` | boolean, default `true` | no | Read the executor and its assigned object back and compare. |
 
 Requests, in order:
@@ -121,7 +125,8 @@ Requests, in order:
    sent. The result carries `previous`.
 3. `cmd` **`Label Page <p>.<e> "<label>"`**.
 4. If `verify`: `objects` `Page <p>.<e>` fields `Object`, `Name`, then `objects` on the assigned
-   object (`<class> <index>`, e.g. `Sequence 901`, reported as `assignedObjectRef`) fields `Name`.
+   object by its reported address, including an object from another data pool, fields `Name`.
+   `assignedObjectRef` retains its compatible class/number display and `assignedObjectAddr` identifies the address actually read.
    Expected: executor Name == label, assigned object's name (as seen from the executor) == label,
    and the object's own Name == label. If the assigned object cannot be addressed, only the
    executor's view is verified and a warning says so.
@@ -155,3 +160,26 @@ programmer, run `GMA3_LIVE=1 npm run test:live`. The test:
    created the page. Nothing calls SaveShow.
 
 All command syntax used by the tools and this test has been confirmed on onPC 2.5.1.
+
+
+## Executor authoring extension (macOS onPC 2.5.1.1)
+
+The macro form sends `Assign Macro <n> At Page <p>.<e>`, with explicit `DataPool <n>` qualifiers supplied by
+`data_pool` and/or the source reference. The read plan checks the source class and address, then the page, then the
+existing assignment. A cell represented by a `Proxy` is covered by an expanded executor and is refused. Occupied
+executors retain the existing `replace` requirement. Read-back compares the assigned address as well as name/class,
+so another object with the same name cannot falsely verify. A lost reply is never retried.
+
+Macro assignment and executor labelling do not run a macro. Labelling renames its pool object everywhere it appears.
+No fixture selection or programmer values are changed. The same server mutation lock covers checks, writes and
+verification; other clients or operators can change the show between those steps.
+
+The live authoring test is `test/live/executor-authoring.live.ts`, run explicitly on a disposable show. It reserves
+Page 91, Sequence 970, Macro 970 and Configuration 970, checks they are free, creates only those objects, exercises source assignment,
+custom commands and sizing, then deletes only its own objects. Nothing calls `SaveShow` or presses an executor.
+
+Live qualification: `test/live/executor-authoring.live.ts` passed **1/1** on **macOS grandMA3 onPC 2.5.1.1**, bridge
+**0.49.0**, in a disposable show. It verified macro assignment and idempotence,
+separate continuous/discrete encoder modes, stored custom commands, 2x2 sizing, occupied-cell and proxy refusals,
+and configuration loading/recasting with cleanup. It sent no playback, executor press or macro execution command
+and did not save the show. The original user show file was not written by this test.
