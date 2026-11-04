@@ -33,6 +33,7 @@ import { registerPositionTools } from "./tools/positions.js";
 import { registerCueListTools } from "./tools/cuelists.js";
 import { registerTypeStructureTools } from "./tools/typestructure.js";
 import { registerCellLayoutTools } from "./tools/celllayout.js";
+import { registerLayoutTools } from "./tools/layouts.js";
 import { registerDmxOutputTools } from "./tools/dmxoutput.js";
 import { registerVariableTools } from "./tools/variables.js";
 import { registerOscTools } from "./tools/osc.js";
@@ -674,6 +675,7 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 registerFixtureTools(server, toolContext);
+registerLayoutTools(server, toolContext);
 registerCueTools(server, toolContext);
 registerExecutorTools(server, toolContext);
 registerInspectionTools(server, toolContext);

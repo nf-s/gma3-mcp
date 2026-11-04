@@ -55,6 +55,7 @@ Workflow tools (shared result model, see [below](#workflow-tools); details in [`
 | `gma3_store_recipe_cues` | The recipe lines of up to 100 cue parts of one sequence in one call (replace or append; group, preset, MAtricks, the per-line MAtricks and fade columns), with the cue's name and note; references checked once up front, a compact read-back per cue (line count and mismatches), an optional cook of every part ([docs](tools/recipes.md#gma3_store_recipe_cues)) |
 | `gma3_assign_to_executor`, `gma3_label_executor` | Inspect, assign Sequence or Macro objects (replacing only with `replace`), label and verify addresses; optional explicit data pool ([docs](tools/executors.md)) |
 | `gma3_executor_configuration` | Load an existing configuration after collision checks, or plan/recast across the complete affected executor list; complete profile saving remains unsupported ([docs](tools/playback.md#gma3_executor_configuration)) |
+| `gma3_layouts`, `gma3_store_layout`, `gma3_edit_layout_elements` | Explicit-pool Layout reads/create/update and bounded element edits with GUID identities, geometry, assignments, actions, appearances, exact text and visibility; separate from fixture cell geometry ([docs](tools/layouts.md)) |
 
 Structured inspection tools (read-only; work with Lua execution disabled; need plugin v0.3.0 or newer, see
 [Updating the plugin](tools/inspection.md#updating-the-plugin-required-once-for-these-tools)):

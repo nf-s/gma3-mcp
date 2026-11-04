@@ -13,6 +13,7 @@ the live test procedure on a disposable show.
 | Cue lists and chases in batches (SU-06; built in Preview, needs `exclusive: true`; preset read-back needs bridge 0.27.0) | `gma3_store_cues`, `gma3_edit_cues`, `gma3_build_chase` | [cuelists.md](cuelists.md) |
 | Executors (FR-06) | `gma3_assign_to_executor`, `gma3_label_executor` | [executors.md](executors.md) |
 | Executor authoring | `gma3_configure_executor`, `gma3_executor_configuration` | [playback.md](playback.md) |
+| General Layout pool authoring | `gma3_layouts`, `gma3_store_layout`, `gma3_edit_layout_elements` | [layouts.md](layouts.md) |
 | Structured inspection (FR-07 .. FR-10) | `gma3_fixture_attributes`, `gma3_programmer`, `gma3_fixture_output`, `gma3_dmx`, `gma3_cue_contents` | [inspection.md](inspection.md) |
 | Console input (KB-05, opt-in on the console) | `gma3_input_interaction`, `gma3_hardkey`, `gma3_keyboard`, `gma3_type`, `gma3_input_sequence`, `gma3_hardkeys_status`, `gma3_hardkeys_release_all` | [input.md](input.md) |
 | Console feedback (KB-06, read-only) | `gma3_feedback` | [feedback.md](feedback.md) |
