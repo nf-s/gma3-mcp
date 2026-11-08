@@ -309,7 +309,8 @@ relaunched, losing unsaved show changes. The bridge cannot interrupt a C call. S
 object reference (`object`, `children`, `objects`, `dump`, `set`, `setfader`, `getfader` and the inspection ops) checks
 the reference first:
 
-* No `Page`/`Executor` keyword (shortcuts `P`, `Ex` and longer prefixes count), or no list operator (`Thru`/`T`, `+`,
+* No `Page`/`Executor` keyword (shortcuts `P`, `Ex` and longer prefixes count), subject to the ViewButton guard below,
+  or no list operator (`Thru`/`T`, `+`,
   `-`): sent to `ObjectList` unchanged. `Page 1.180` (one empty executor reads nil, "no object found") and
   `Sequence 9000 Thru 9001` are verified safe.
 * `Page P.E Thru P.E2`, `Page P Thru P2` and `+` lists of those terms (pages and executors not mixed, an executor
@@ -324,6 +325,23 @@ the reference first:
 
 The guard does not cover `gma3_lua`: a script that calls `ObjectList` with an executor range still hangs the console.
 Evidence: [probes/objectlist-hang-macos-2.5.1.md](probes/objectlist-hang-macos-2.5.1.md).
+
+### ViewButton lookups (plugin v0.50.1)
+
+The bridge refuses references containing `ViewButton` (shortcut `ViewB`) and a range, list or wildcard with
+`[unsafe-range]` before calling `ObjectList`. This also covers mixed expressions such as
+`View 53 Thru 59 + ViewButton 1.15 Thru 1.20`. Use a separate single reference for each button, for example
+`gma3_get_object` with `ViewButton 1.15` followed by `ViewButton 1.16`. Stored views are separate objects.
+`View 53 Thru 59` continues through the usual lookup path.
+
+For a screen inventory, a single resolved button's parent address is a candidate for a bounded
+`gma3_list_children` read. Confirm that the reported parent is the intended screen's button container first.
+MA's bundled tests traverse buttons under the profile's screen configuration. The exact parent path and returned
+children can depend on the active profile and screen configuration.
+
+The ViewButton check is precautionary. Automated tests establish that the previous bridge forwarded those expressions
+unchanged and that this guard intercepts them. They do not establish that a ViewButton range hangs the console. The
+guard covers structured object lookups, while raw Lua and command dispatch retain their existing behavior.
 
 ### Preset ranges (plugin v0.46.0)
 

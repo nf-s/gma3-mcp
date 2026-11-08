@@ -157,7 +157,7 @@ local my_handle     = select(4, ...)
 local socket = require("socket")
 local json   = require("json")
 
-local VERSION      = "0.50.0"
+local VERSION      = "0.50.1"
 local DEFAULT_PORT = 9800
 -- Execution policy defaults for the "lua" op (see header). Changed per start with the
 -- "luatime=<ms>" / "luasteps=<n>" tokens, or at runtime with "lua on|off".
@@ -319,7 +319,7 @@ end
 -- cannot interrupt a C call, so a reference that names more than one page or executor is expanded
 -- here into single "Page P" / "Page P.E" lookups (an empty executor or a missing page reads nil,
 -- verified live) or refused with [unsafe-range] when it cannot be expanded faithfully. References
--- without a Page or Executor keyword, and single pages/executors, still go to ObjectList unchanged.
+-- without a guarded keyword, and single pages/executors, still go to ObjectList unchanged.
 local MAX_EXPANDED_OBJECTS = 1000
 -- Page and executor numbers taken from a reference: plain digit strings in 1..9999 (the page pool
 -- holds 9999; executor numbers stay below 1000 on 2.5.1). Anything else is refused before any
@@ -361,19 +361,23 @@ local function isPageWord(t) return t.kind == "word" and isPrefixOf(t.lower, "pa
 local function isExecutorWord(t) return t.kind == "word" and isPrefixOf(t.lower, "executor", 2) end
 local function isThruWord(t) return t.kind == "word" and isPrefixOf(t.lower, "thru", 1) end
 
--- Plan for a reference that names pages or executors. Returns nil when the reference does not need
--- the guard (no Page/Executor keyword, or no Thru / + / - list operator and no * wildcard), otherwise a plan
+-- Check ViewButton lists and plan safe expansion for references that name pages or executors.
+-- Returns nil for an unguarded reference or a single lookup, otherwise a plan
 -- { kind = "pages" | "executors", items = { { page = P, exec = E|nil }, ... } } in the given order
 -- without duplicates. Raises [unsafe-range] for a multi-object form it does not expand.
 local function pageRangePlan(ref)
   local toks = refTokens(ref)
-  local keyed, listOps, wildcard = false, 0, false
+  local keyed, viewButton, listOps, wildcard = false, false, 0, false
   for _, t in ipairs(toks) do
     if isPageWord(t) or isExecutorWord(t) then keyed = true end
+    if t.kind == "word" and isPrefixOf(t.lower, "viewbutton", 5) then viewButton = true end -- ViewB
     if isThruWord(t) or (t.kind == "symbol" and (t.text == "+" or t.text == "-" or t.text == ",")) then listOps = listOps + 1 end
     -- "*" selects every object of the type as a number ("Page 1.*", "Executor *") and matches
     -- several names inside quotes ("Page \"*\""), per the 2.5 manual.
     if (t.kind == "symbol" and t.text == "*") or (t.kind == "string" and t.text:find("*", 1, true)) then wildcard = true end
+  end
+  if viewButton and (listOps > 0 or wildcard) then
+    error(string.format("[unsafe-range] '%s' contains a ViewButton range, list or wildcard. Read one ViewButton S.N at a time", ref), 0)
   end
   if not keyed then return nil end
   local function refuse(why)
