@@ -168,7 +168,8 @@ class Console {
       const [pool, no] = key.split(".").map(Number);
       const types: Record<string, string> = {};
       for (const sf of (args.typesFor as number[] | undefined) ?? []) if (bySf.get(sf)) types[String(sf)] = bySf.get(sf)!.type;
-      return { ref, addr: `addr.${key}`, no, name: p.name, pool: { no: pool, name: POOLS[pool]?.name ?? "?" }, presetMode: p.presetMode, storedData: this.storedData(p), lock: p.lock, rows: p.rows, count: p.rows.length, dependencies: p.deps, dependenciesReadable: true, types };
+      // referencedBy as bridge 0.50.1 sends it: the entries of the console's References text, cut at 1,016 characters.
+      return { ref, addr: `addr.${key}`, no, name: p.name, pool: { no: pool, name: POOLS[pool]?.name ?? "?" }, presetMode: p.presetMode, storedData: this.storedData(p), lock: p.lock, referencedBy: 79, rows: p.rows, count: p.rows.length, dependencies: p.deps, dependenciesReadable: true, types };
     });
     h.fake.on("fixtureAttributes", (args) => {
       const ref = String(args.ref);
@@ -500,6 +501,7 @@ test("gma3_preset reads content and follows dependencies, reporting invalid and 
   const { result, isError } = await h.callJson("gma3_preset", { preset: "23.1" });
   assert.equal(isError, false);
   assert.equal(result.rows[0].embeddedFrom, 'Preset 4.1 "Src"');
+  assert.equal("referencedBy" in result, false, "the bridge's References entry count is not a count of the objects that use the preset");
   assert.deepEqual(result.dependencies, [{ preset: 'Preset 4.1 "Src"', valid: true }, { preset: null, valid: false }]);
   assert.equal(result.dependencyInspection.complete, false, "4.9 could not be read");
   assert.equal(result.dependencyInspection.depthRead, 1);

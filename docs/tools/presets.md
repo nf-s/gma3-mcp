@@ -156,8 +156,10 @@ is a separate change.
 ## `gma3_preset`
 
 - `{ preset: "4.12" }`:
-  - **Summary:** `name`, `pool`, `featureGroup`, `presetMode`, `storedData`, `locked`, `hasMAtricks`, `referencedBy`
-    (how many objects use the preset).
+  - **Summary:** `name`, `pool`, `featureGroup`, `presetMode`, `storedData`, `locked`, `hasMAtricks`.
+  - **Not reported:** which or how many objects use the preset. The bridge's `referencedBy` counts the entries of the
+    console's `References` text, which is cut at 1,016 characters and lists console handles, so it is not a count of
+    users (see [the bridge protocol](../reference.md#preset-reads-plugin-v0220-sb-03)).
   - **Rows:** one per fixture and attribute, with `mode`, `value` (percent) or `steps`, `fade`, `delay`, `relative`,
     `fixtureType`, and `embeddedFrom` / `relativeFrom` for an embedded absolute / relative value.
   - **Phaser data** (bridge 0.23.0): `steps` with each step's `absolute`/`relative`, `width`, `trans`, `accel`,

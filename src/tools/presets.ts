@@ -113,7 +113,6 @@ export interface PresetRead {
   maxDepth?: string | number;
   hasMAtricks?: string;
   inputFilter?: string;
-  referencedBy?: number;
   dependencies: Array<ObjectRefInfo & { contentCrc?: string }>;
   dependenciesReadable?: boolean;
   rows: PresetRow[];
@@ -562,7 +561,6 @@ export async function presetInfo(ctx: ToolContext, raw: { preset?: string; pool?
       storedData: p.storedData || "",
       locked: p.lock === null || p.lock === undefined ? null : String(p.lock).trim() !== "" && String(p.lock).trim().toLowerCase() !== "no",
       hasMAtricks: p.hasMAtricks,
-      referencedBy: p.referencedBy ?? null,
       count: p.count ?? p.rows.length,
       ...(p.truncated ? { truncated: true } : {}),
       rows: presentRows(p.rows),
@@ -953,8 +951,8 @@ export const registerPresetTools: RegisterTools = (server, ctx) => {
     {
       title: "Read a preset's stored content and references, or a pool's storage defaults",
       description:
-        "Read-only. preset: \"<pool>.<number>\" returns what the preset actually stores: per fixture and attribute the mode the value was stored in (selective; global, held by the lowest FID of a fixture type; universal, one holder), value (percent) or steps (each with absolute/relative, width, trans, accel, decel and the preset it integrates; absent layers are the console defaults width/trans 100, accel/decel 0), the phaser layers speedBpm, phase (degrees), measure (beats) and speedMaster (absent: 60 BPM, phase 0), fade/delay, and the source preset of an embedded value; plus PresetMode, StoredData, lock, how many objects reference it, " +
-        "and its dependencies (embedded sources) followed recursively with validity (a deleted source is an invalid dependency) and whether that inspection was complete. pool: <n> returns the pool's default mode and input filter and the operator's store preferences (the defaults a store would otherwise use). Needs bridge 0.22.0.",
+        "Read-only. preset: \"<pool>.<number>\" returns what the preset actually stores: per fixture and attribute the mode the value was stored in (selective; global, held by the lowest FID of a fixture type; universal, one holder), value (percent) or steps (each with absolute/relative, width, trans, accel, decel and the preset it integrates; absent layers are the console defaults width/trans 100, accel/decel 0), the phaser layers speedBpm, phase (degrees), measure (beats) and speedMaster (absent: 60 BPM, phase 0), fade/delay, and the source preset of an embedded value; plus PresetMode, StoredData, lock " +
+        "and its dependencies (embedded sources) followed recursively with validity (a deleted source is an invalid dependency) and whether that inspection was complete. It does not say which or how many objects use the preset: the console's References text is cut at 1,016 characters and is not a count of users. pool: <n> returns the pool's default mode and input filter and the operator's store preferences (the defaults a store would otherwise use). Needs bridge 0.22.0.",
       inputSchema: {
         ...dataPoolShape,
         preset: z.string().optional().describe('Preset as "<pool>.<number>", e.g. "4.12".'),

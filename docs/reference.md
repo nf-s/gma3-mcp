@@ -384,7 +384,10 @@ Two read-only ops (not guarded, usable with Lua disabled):
   mode (selective | global | universal), hasAbsolute, hasRelative, value, valueRaw, relative, fade, delay, speed,
   phase, stepCount, steps?, absPreset?, relPreset?}`, sorted by subfixture index; `absPreset` / `relPreset` and each
   dependency are `{valid, addr, addrNative, name, no, pool, poolName}`, or `{valid: false}` for a deleted source;
-  dependencies also carry `contentCrc`. `typesFor: [subfixture index, ...]` returns `types` with the fixture type each
+  dependencies also carry `contentCrc`. `referencedBy` is the number of comma-separated entries in the preset's
+  `References` text (`<handle>:<64-bit value>` per entry, sorted by handle). On onPC 2.5.1.1 that text is cut at 1,016
+  characters, so a long list stops there; the number is not a count of the objects that use the preset, and
+  `gma3_preset` does not report it. `typesFor: [subfixture index, ...]` returns `types` with the fixture type each
   of those subfixtures gets in the rows (a cell takes its fixture's). A non-preset is `[not-preset]`; unreadable preset
   data is `[unreadable]`, never an empty preset. At most 5000 rows.
 * `preset.context {pool?}`: `{preferences, preferencesReadable, pool?}`: the operator's StorePreferences (StoreMode,

@@ -26,12 +26,22 @@ Evidence for [SB-03 in SHOWS.md](../../SHOWS.md#sb-03--create-reusable-presets-w
 | `StoredData` | read-only text of the stored layers: `Selective`, `Global`, `Universal`, `Selective/Global`, `""` for an empty preset |
 | `FeatureGroup`, `MaxDepth`, `HasAnyMAtricksData`, `InputFilter`, `Lock` | as named |
 | `Get("Dependencies")` | a Lua table, one entry per embedded source: `{ key = <source preset handle>, content_crc, name_crc }` |
-| `References` | text `"<handle int>:<count>,..."` of the objects that use the preset |
+| `References` | text `"<handle int>:<64-bit value>,..."`, sorted by handle; see the correction below |
 | `GetPresetData(p, false, true)` | per UI channel and under `by_fixtures[<fid or "501.2">][<attribute>]`: steps (`[1].absolute`, percent), `preset_store_mode` (1 selective, 2 global, 3 universal), `selective`, `fade`, `delay`, `dict_flags.has_absolute` / `has_relative`, `abs_preset` / `rel_preset` (source handle of an embedded value), `mask_individual` (0 on an embedded step) |
 
 The object ops render Dependencies / PresetData as `""`; the bridge's `preset.read` op (0.22.0) reads them. The show's
 own universal presets keep their data on MA's Universal fixture (`by_fixtures` key "Generic 1", subfixture index 0,
 type "Moving Head"); a cell has no FixtureType of its own (its fixture's applies).
+
+**Correction (2026-11-16, read-only reads of a working show on onPC 2.5.1.1, bridge 0.50.1).** `References` is not
+a count of users. The handles are console object handles (the `#<hex>` form, in decimal), and they appear to be
+objects that refer to the preset: one handle appeared in the lists of the three sources of one embedding preset whose
+lists were not cut before it, and a preset with five embedded sources listed a single entry, so the list is not what
+the preset itself refers to. The value after the colon is 0, 1 or a 64-bit number that repeats for the same handle in
+different lists, so it is not a count either. The text is cut at 1,016 characters, often in the middle of an entry,
+so a long list reads as 56 to 79 entries. Presets that no recipe step, recipe line or shape named showed the same long
+run of `:0` entries as presets that recipe steps do name, and those handles were not resolved to objects (Lua was
+disabled). `gma3_preset` therefore no longer reports `referencedBy`.
 
 ## Modes
 
