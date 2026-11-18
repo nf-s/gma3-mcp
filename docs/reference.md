@@ -14,12 +14,18 @@
 | `GMA3_INSTALL_DIR` | `~/MALightingTechnology` | Base folder containing versioned `gma3_<version>` directories; set explicitly on Windows |
 | `GMA3_HELP_DIR` | *(auto-detected)* | Override with the exact manual HTML directory (`gma3_<version>/shared/language/HTML`) |
 | `GMA3_DOCS_URL` | *(unset)* | Optional loopback HTTP origin for the separately managed documentation API; enables three read-only docs tools and indexed `gma3_help`. No redirects or hosted login. See [indexed docs](tools/docs.md). |
+| `GMA3_NET_OUTPUT_HOST` | `0.0.0.0` | Bind address of the `gma3_network_output` listener ([docs](tools/network-output.md#configuration)) |
+| `GMA3_NET_OUTPUT_SACN_PORT` / `GMA3_NET_OUTPUT_ARTNET_PORT` | `5568` / `6454` | Ports the listener binds (`0`: ephemeral) |
+| `GMA3_NET_OUTPUT_MULTICAST` | `1` | `0`: the listener joins no sACN multicast groups |
+| `GMA3_NET_OUTPUT_IDLE_MS` | `60000` | The listener closes after this long with no call |
+| `GMA3_AFTER_SAVE_HOOK` | *(none)* | Program started after every verified `gma3_save_show`, with the saved show's name (for example to commit show files to git); see [show.md](tools/show.md) |
+| `GMA3_UNDO_GROUPS` / `GMA3_UNDO_EXCLUDE` | off / *(none)* | `1` makes each tool call's commands one console undo group, so one Oops reverts them (bridge 0.55.0). Only commands sent through the bridge's `cmd` op join; property writes, CmdIndirect sends and Lua do not, and `gma3_load_show`, `gma3_save_show` and `gma3_patch_*` are never grouped. While a call runs, an operator's Oops answers "Not possible at the moment". `GMA3_UNDO_EXCLUDE`: more tool names (or `prefix*`) to leave out. `gma3_undo` (bridge 0.56.0) undoes the latest groups after checking they are the console's latest undo steps |
 
 ## Tools
 
 | Tool | What it does |
 | --- | --- |
-| `gma3_status` | Bridge reachability, software version, show file, user; whether this server build matches its source checkout (`server.build`, [below](#build-staleness)) |
+| `gma3_status` | Bridge reachability, software version, show file, user; `bridge.show` (`saveNeeded`: unsaved changes, `fileStatus`: ShowLoaded, ShowSaving, …) and `bridge.instance` (new on every bridge start), both from bridge 0.53.0; whether this server build matches its source checkout (`server.build`, [below](#build-staleness)) |
 | `gma3_command` | Execute a command line command, returns OK / Syntax Error / Illegal Command |
 | `gma3_lua` | Evaluate Lua inside onPC and return the result as JSON. Off until the operator [enables it on the console](lua.md); uses a best-effort execution budget |
 | `gma3_lua_api` | Search the live Lua API descriptor (names, arguments, returns) |
@@ -27,6 +33,7 @@
 | `gma3_list_children` | Children of an object with selected property values, paginated; `truncated: true` when more follow, `compact: true` ([below](#pool-usage-and-truncated-listings)) |
 | `gma3_objects` | Resolve a range like `Fixture 1 Thru 20` to objects with property values. Page and executor lists are expanded by the bridge (v0.20.0, [below](#page-and-executor-ranges-plugin-v0200)), and so are preset ranges and `+` lists that name the pool (v0.46.0, [below](#preset-ranges-plugin-v0460)); `truncated: true` when more follow, `compact: true` |
 | `gma3_pool_usage` | Read-only: per pool, the stored count, the used numbers as ranges, optional `[no, name]` pairs and the first free block of a size; preset pools, a page's executors and every page ([below](#pool-usage-and-truncated-listings)) |
+| `gma3_preset_usage`, `gma3_cue_diff`, `gma3_tracking_leaks` | Read-only show analysis over stored cue data: where a preset is used (and the executors that play it) or which cue data points at deleted presets; a per-attribute diff of two cues; candidates for values that keep tracking unintentionally. Bounded scans with coverage and a resume point ([below](#show-analysis-preset-usage-cue-diff-tracking-leaks)) |
 | `gma3_dump` | Raw `Dump()` text of an object |
 | `gma3_set_property` | `Set()` a property and read it back: plain values (Yes/No, enums, numbers, exact text) are verified, a kept value is an error naming the lock (or saying its state is unknown); references, a macro line's Command and Wait, Tags and reformatted values are returned unverified with the typed tool that checks them |
 | `gma3_playback` | Go+, Go-, Pause, Off, Top, Flash, Load, ReSync, ... on a sequence, executor or tag; reads the playback state back a frame later (for a tag, every tagged sequence) ([docs](tools/live-reads.md), [resync](tools/tempo-sync.md#resync)) |
@@ -36,7 +43,8 @@
 | `gma3_docs_search`, `gma3_docs_get`, `gma3_docs_reference` | Optional bounded, versioned document search, text and exact command/scoped Lua extracts with full source provenance; no console connection required ([docs](tools/docs.md)) |
 | `gma3_start_bridge` | Start the plugin over OSC when the bridge is down |
 | `gma3_tempo_sync_status`, `gma3_configure_tempo_sync` | The tempo-sync plugin (bdstark/gma3-beat-sync): whether it is imported and running, its readings, and its configuration, read back; `gma3_playback` `resync` realigns running phasers ([docs](tools/tempo-sync.md)) |
-| `gma3_show_files`, `gma3_save_show` | List the show files and save the show under the current or a new name; another show's file needs `overwrite: true`; SaveShow's own confirmation is answered ([docs](tools/show.md)) |
+| `gma3_show_files`, `gma3_save_show`, `gma3_load_show` | List the show files and save the show under the current or a new name; another show's file needs `overwrite: true`; SaveShow's own confirmation is answered. Load another show (unsaved changes refused, saved or discarded as asked) and restart the bridge the load unloaded ([docs](tools/show.md)) |
+| `gma3_undo` | Undo the last tool call(s) of this server, one console undo group each (`GMA3_UNDO_GROUPS=1`, bridge 0.56.0), after checking they are the console's latest undo steps; no blind Oops ([docs](tools/undo.md)) |
 | `gma3_tags`, `gma3_store_tag`, `gma3_delete_tag`, `gma3_assign_tag`, `gma3_configure_tag` | Tags: the pool and the objects that carry each tag (reverse lookup, paged), create, rename, delete, assign and unassign with protect and `data_pool`, kill type, forwarding, action, appearance and note; `gma3_playback` on a tag reads each tagged sequence back ([docs](tools/tags.md)) |
 | `gma3_osc`, `gma3_configure_osc`, `gma3_test_osc_input` | Read and configure OSC input and output (who can send commands, where output goes), and prove input works with a loopback test ([docs](tools/osc.md)) |
 
@@ -47,17 +55,23 @@ Workflow tools (shared result model, see [below](#workflow-tools); details in [`
 | `gma3_select` | Select fixtures by range or group; optional `ClearSelection` first ([docs](tools/fixtures.md)) |
 | `gma3_set_attribute`, `gma3_set_color`, `gma3_set_position` | `Attribute "<name>" At ...` on an explicit target or, on request, the current selection; RGB 0–100, pan/tilt with explicit units. Small explicit targets are pre-checked against the fixture type's attributes, and the programmer is read back and compared per fixture in the unit sent ([docs](tools/fixtures.md)) |
 | `gma3_clear_programmer` | `ClearSelection`, `ClearActive` or `ClearAll`, chosen explicitly ([docs](tools/fixtures.md)) |
-| `gma3_store_cue`, `gma3_store_cue_part` | `Store ... /NoConfirmation` with explicit create / merge / overwrite mode, name and timing set as separate verified steps ([docs](tools/cues.md)) |
+| `gma3_store_cue`, `gma3_store_cue_part` | `Store ... /NoConfirmation` with explicit create / merge / overwrite mode, name and timing set as separate verified steps, and the stored values read back against what the ChannelFilter store preference takes ([docs](tools/cues.md)) |
 | `gma3_set_cue_timing`, `gma3_set_cue_trigger` | Edit part timing (fade, delay, out fade, out delay, snap delay) and trigger (Go, Time, Follow, Sound, BPM) with read-back ([docs](tools/cues.md)) |
 | `gma3_goto_cue`, `gma3_delete_cue` | `Goto` (a playback mutation) and single-cue `Delete ... /NoConfirmation` with existence checks ([docs](tools/cues.md)) |
-| `gma3_store_cues` | A list of cues in one call, each from explicit looks (fixtures + presets, intensity, attribute values), with names, timing, triggers, commands and notes; built in the Preview environment (nothing output, Normal programmer untouched), each look checked before its store, reported per cue ([docs](tools/cuelists.md)) |
+| `gma3_store_cues` | A list of cues in one call, each from explicit looks (fixtures + presets, intensity, attribute values), with names, timing, triggers, commands and notes; built in the Preview environment (nothing output, Normal programmer untouched), each look checked before its store and the stored values read back after it, reported per cue ([docs](tools/cuelists.md)) |
 | `gma3_edit_cues` | The same trigger and timing, and one name per cue, on a list, range or all cues of a sequence, read back per cue ([docs](tools/cuelists.md)) |
 | `gma3_build_chase` | A looping chase into an empty sequence (one cue per look or preset, Time triggers, Wrap Around), then plays it and verifies one observed cycle through the wrap ([docs](tools/cuelists.md)) |
+| `gma3_pool_objects` | Copy, move, delete and rename groups, sequences, macros, MAtricks, timecodes, layouts and presets: occupied destinations refused (copy: unless overwrite or merge; move: always), a delete refused while the object is on an executor, referenced by other objects or running (`force: true` overrides), new names checked against the pool; read back ([docs](tools/pool-objects.md)) |
+| `gma3_pool_details` | Read-only: the show's filters, worlds, appearances or views, decoded: the attributes a filter or world passes (by name and feature group), a filter's value layers and dynamic rules, an appearance's colour and image, a view's windows ([docs](tools/worlds-filters.md)) |
+| `gma3_store_filter` | Store or update attribute filters from attribute names and feature groups (minus `exclude`) and value layers: `Store Filter <n>`, then the Attributes and layers written and read back exactly; taken numbers refused unless `on_taken: "update"` ([docs](tools/worlds-filters.md)) |
+| `gma3_set_appearance` | Create or change an appearance (background colour, alpha, image, image mode) and assign it to pool objects (`Assign Appearance <n> At <object>`), read back by handle; a dialog that opens stops the rest ([docs](tools/worlds-filters.md)) |
+| `gma3_store_agenda` | Agenda entries (a list per call): a time of day or a twilight time (dawn, sunrise, sunset, dusk with an offset) that runs a sequence, macro or plugin with an action, or a command, with an end date or time, a minute interval and repeat every year; a taken number refused unless `overwrite`, the target checked, the property names read from an entry's schema, the entry disabled while configured and enabled last, every property read back and the Object by address; warns while the console's location is the factory one ([docs](tools/agenda.md)) |
 | `gma3_recipes`, `gma3_edit_recipe`, `gma3_cook_recipes` | Read, add, change, move or remove one recipe line of a preset or cue part (references checked, every line read back); cook a preset, part, cue or sequence with an explicit option, verified ([docs](tools/recipes.md)) |
+| `gma3_edit_phaser_recipe` | Build one phaser recipe line (group, shape, 2 step presets, MAtricks, speed, phase) in a free preset slot through the Edit Recipe mode: checked first, "Update last object?" prevented (Cancel if it opens), programmer cleared, read back ([docs](tools/recipes.md#gma3_edit_phaser_recipe)) |
 | `gma3_store_recipe_cues` | The recipe lines of up to 100 cue parts of one sequence in one call (replace or append; group, preset, MAtricks, the per-line MAtricks and fade columns), with the cue's name and note; references checked once up front, a compact read-back per cue (line count and mismatches), an optional cook of every part ([docs](tools/recipes.md#gma3_store_recipe_cues)) |
 | `gma3_assign_to_executor`, `gma3_label_executor` | Inspect, assign Sequence or Macro objects (replacing only with `replace`), label and verify addresses; optional explicit data pool ([docs](tools/executors.md)) |
 | `gma3_executor_configuration` | Load an existing configuration after collision checks, or plan/recast across the complete affected executor list; complete profile saving remains unsupported ([docs](tools/playback.md#gma3_executor_configuration)) |
-| `gma3_layouts`, `gma3_store_layout`, `gma3_edit_layout_elements` | Explicit-pool Layout reads/create/update and bounded element edits with GUID identities, geometry, assignments, actions, appearances, exact text and visibility; separate from fixture cell geometry ([docs](tools/layouts.md)) |
+| `gma3_layout_elements`, `gma3_configure_layout`, `gma3_edit_layout_elements` | In an explicit data pool: read a layout's elements with GUID identities, create an empty layout or set its canvas and view settings, and add, update or remove single elements in place (geometry, assignments, actions, appearances, exact text, visibility); never rebuilds a layout. `gma3_store_layout` builds one from a list or grid ([docs](tools/layout-editing.md)) |
 
 Structured inspection tools (read-only; work with Lua execution disabled; need plugin v0.3.0 or newer, see
 [Updating the plugin](tools/inspection.md#updating-the-plugin-required-once-for-these-tools)):
@@ -71,7 +85,8 @@ Structured inspection tools (read-only; work with Lua execution disabled; need p
 | `gma3_dmx` | Raw or percent DMX values of a universe and channel range, with `granted` and optional patch lookup ([docs](tools/inspection.md)) |
 | `gma3_dmx_output` | Read-only: universes in use with grant, request and ports, the Art-Net / sACN entries that send each one, the protocols and output stations; each universe explained (not granted, not sent, sent as) (bridge 0.30.0, [docs](tools/dmx-output.md)) |
 | `gma3_configure_dmx_output` | Art-Net / sACN output on or off, data entries added, edited or removed, universes' grant request; validated, previewed, read back; `network: true` required before DMX goes onto the network (bridge 0.30.0, [docs](tools/dmx-output.md)) |
-| `gma3_cue_contents` | Stored cue and part data without Goto or Load: timing, command, recipes and preset references (optionally expanded); hard fixture values are reported as a documented limitation on 2.5.1 ([docs](tools/inspection.md)) |
+| `gma3_network_output` | Read-only, passive: listens to the sACN (UDP 5568) and Art-Net (UDP 6454) DMX the console sends to this machine; per universe protocol, source, priority, fps and values after the console's merge; `samples` for fades; needs no bridge, hints when nothing arrives ([docs](tools/network-output.md)) |
+| `gma3_cue_contents` | Stored cue and part data without Goto or Load: timing, command, recipes and preset references (optionally expanded); and the values each part stores, hard and cooked (GetPresetData on the part) ([docs](tools/inspection.md)) |
 
 Structured input tools (KB-05; need plugin v0.7.0 and the operator's `Plugin "gma3_mcp_bridge" "input=keyboard"`;
 real console keys are pressed; details in [`tools/input.md`](tools/input.md)):
@@ -94,7 +109,7 @@ require `exclusive: true` and have no undo; details in [`tools/patch.md`](tools/
 | `gma3_patch_types` | Read-only: the show's fixture types and DMX modes with footprint and breaks |
 | `gma3_patch_list` | Read-only: fixtures of the live patch (all stages, sub-fixtures) with FID, CID, type, mode, address, breaks, stage; FID range filter |
 | `gma3_patch_add` | Add fixtures of one type/mode at consecutive FIDs, patched from an address or the first free block; pre-checked, committed, read back; a stage with a Name (any session on one) needs bridge 0.45.0 |
-| `gma3_patch_set` | Readdress (swaps and moves across a fixture's own range work), unpatch or rename fixtures |
+| `gma3_patch_set` | Readdress (swaps and moves across a fixture's own range work), unpatch (a multi-break fixture break by break, bridge 0.51.0) or rename fixtures |
 | `gma3_patch_remove` | Delete fixtures (not ones with sub-fixtures) |
 | `gma3_patch_move` | Move fixtures under a top-level grouping fixture (the MA Show Start's FID 1-8) or back to the top level: Cut, ChangeDestination, Paste and the console's Move Fixtures dialog (absolute or relative 3D placement) answered by the bridge; read back against the state before: parent, address, groups, 3D pose (bridge 0.42.0) |
 | `gma3_patch_stages` | List the stages (position, name, fixtures, spaces), or create, rename or remove (only empty ones after the first) stages in one patch session; names unique ignoring case, also after a removal; read back from the live patch (bridge 0.48.0; 0.49.0 for the bridge-side removal checks) |
@@ -103,14 +118,21 @@ require `exclusive: true` and have no undo; details in [`tools/patch.md`](tools/
 | `gma3_patch_import` | Import one library file into the show: duplicate check, wait for exactly one new type, committed, read back with its modes (bridge 0.26.0) |
 | `gma3_patch_remove_type` | Delete a fixture type no fixture uses; reports the renumbered types; its attributes stay (bridge 0.26.0) |
 | `gma3_patch_library_add` | Put a `.gdtf` or user `.xml` into the user library over the bridge (content or a server-side path): name, size and content checked first, written in chunks, moved into place on a matching CRC-32, read back (bridge 0.38.0) |
+| `gma3_patch_import_mvr` | Patch and place the fixtures of an MVR file: read here (not Partial Show Read), every fixture, stage, type match, FID and DMX range checked first (`patch.check ranges`), then `gma3_patch_library_add` + `gma3_patch_import` for missing GDTFs, `gma3_patch_add` in blocks, `gma3_patch_set` names, `gma3_place_fixtures`; preview; stops at the first failure (bridge 0.58.0; [tools/mvr.md](tools/mvr.md)) |
 | `gma3_patch_type_structure` | Read-only: a fixture type's modes with cells, every DMX channel expanded per cell with its attribute, the geometry tree with positions and the model dimensions, in m, cm, mm, ft or in (bridge 0.28.0) |
 | `gma3_set_attributes` | Intensity and several attributes on one target in one call, read back per fixture and cell |
 | `gma3_apply_preset` | `At Preset` on a target (by number or name); refused for a missing preset or an empty target; read back by the programmer's preset link (bridge 0.27.0) |
 | `gma3_release_attributes` | `Off Attribute` (`Off Attribute Thru` for every value) on an established target; read back by comparing the whole programmer, collateral included |
 | `gma3_fixture_positions` | Read-only: position, rotation (with its quaternion) and mesh mirroring of fixtures, in m, cm, mm, ft or in, with the axes' meaning |
-| `gma3_place_fixtures` | Place fixtures in 3D: positions, rotations (written as one quaternion), mesh mirroring; line, arc and mirror-pair layouts; preview; read back by quaternion; returns a restore list (no undo) |
+| `gma3_place_fixtures` | Place fixtures in 3D: positions, rotations (written as one quaternion), mesh mirroring; line, arc and mirror-pair layouts; preview; read back by quaternion; returns a restore list (no undo). A fixture inside a grouping fixture only while every grouping fixture above it is at the origin with no rotation |
 | `gma3_layout_cells` | Lay out a fixture's cells (string lights, pixel strands) along a line, square wave, zigzag or points, in explicit units: shared (the type's layout; `affects` must name every fixture that moves) or own (a copy of the type for some fixtures); read back per cell; returns the previous positions (bridge 0.29.0) |
 | `gma3_assign_cell_layout` | Move fixtures to another layout type of their fixture (a copy, or back to the original) in an isolated patch session (bridge 0.29.0) |
+| `gma3_image_add` | Put a `.png` / `.jpg` into the Images pool (`Image 3.<n>`): uploaded over the bridge into `gma3_library/media/images`, imported with `Import Image 3.<n> /File`, read back by file name and size (bridge 0.57.0; [tools/bitmaps.md](tools/bitmaps.md)) |
+| `gma3_build_bitmap` | Store a Bitmap (pixel mapping) on an image: canvas size, content mode, control values, channels, name, speed master, each read back; `apply` (group) and `store` (preset or cue) are reported but unverified (bridge 0.57.0) |
+| `gma3_agenda` | Read-only: the Agenda's entries, whether the agenda runs, and the location twilight times use, with today's dawn, sunrise, sunset and dusk ([docs](tools/agenda.md)) |
+| `gma3_bitmaps` | Read-only: bitmaps with their configs and channels, and the Images pool (bridge 0.57.0) |
+| `gma3_store_layout` | Build a layout view (Layout pool) from elements (one pool object each, with position, size, label, action, appearance, visibility, text settings) and/or a grid of a range; refuses a taken layout unless `overwrite` (rebuild) or `append`; each Assign must add exactly one element showing its object before its properties are set; everything read back ([tools/layouts.md](tools/layouts.md)) |
+| `gma3_layouts` | Read-only: the Layout pool, or one layout's elements with the object each shows and their properties |
 | `gma3_dialog` | Read the console's top dialog (title, message, buttons) or press one button by its text, only while the dialog still shows what was read; reports whether it closed (bridge 0.42.0) |
 
 Console feedback (KB-06; needs plugin v0.8.0; read-only, works with Lua and input disabled and while another client
@@ -171,6 +193,73 @@ before.
 returned items stop before `total` (a read of `Macro Thru` stops at the default limit of 500). With `fields`,
 `compact: true` drops `addr` and `addrNative` from every item and returns minified JSON.
 
+### Show analysis: preset usage, cue diff, tracking leaks
+
+Three read-only tools (`src/tools/analysis.ts`) analyse what cues store. They use existing bridge ops only, work with
+`gma3_lua` disabled and never play, load or select anything:
+
+| Read | Gives |
+| --- | --- |
+| `children` on `DataPool.Sequences`, then on `Sequence N` (`No` with `asText: false`), page by page | the sequences and their cues in number order; CueZero (`No` 0) and OffCue (no `No`) are left out and the results say so; a cue with a positive `No` is scanned whatever its name |
+| `cueContents` on `Sequence N Cue C` (what `gma3_cue_contents` reads) | cue properties (Release, Break, trigger, ...), the sequence's Tracking, each part's number, timing (TrackingDistance included), `OwnDataPresent` and recipe lines with their resolved preset |
+| `preset.read` on `Sequence N Cue C Part P` (bridge 0.24.0) | GetPresetData on the part: per fixture and attribute the stored value, phaser steps, fade/delay, `cooked`, and the preset each value references (`absPreset`, `relPreset`, a step's `integrated`) |
+| `children` on `DataPool.Pages` and each page (`findReferencesWhere`) | the executors whose object is a sequence with a usage |
+
+A part whose `OwnDataPresent` reads No holds no data and is not read. A part is addressed by command form (its address
+holds a negative cue index and does not resolve). No range is ever sent. The stored-data read through `preset.read`
+covers hard values too; `gma3_cue_contents` returns them per part (`storedValues`) through the same read
+(`src/tools/storedvalues.ts`).
+
+- **`gma3_preset_usage`** `{preset: "4.12"}` lists one row per cue part that references the preset:
+  `{sequence, cue, part, cueName, channels, fixtures, attributes, via}`, `via` being `absolute`, `relative`,
+  `phaser step`, `cooked` or `recipe line n`, and per sequence the executors that play it (`executors: false` skips
+  that). `preset.consoleReferenceCount` is the console's own reference count (its `References` property), for
+  comparison only. `{dangling: true}` lists the parts whose data holds an invalid preset handle, saying where (`examples`:
+  fixture, attribute and absolute / relative / step) but not which preset it was. Deleting a preset that cue data
+  references does NOT leave one: the console keeps the values as plain values with no reference (live onPC 2.5.1,
+  [cue-part-data-macos-2.5.1.md](probes/cue-part-data-macos-2.5.1.md)); a preset inside a preset does keep an
+  invalid handle (sb-03). A recipe line whose preset text no longer resolves is
+  listed too. A recipe line whose preset was deleted reads an empty Values field (sb-05) and cannot be found. Both
+  can be asked in one call. `sequences` narrows the scan.
+- **`gma3_cue_diff`** `{a: {sequence, cue}, b: {sequence?, cue}}` compares the stored data of two cues, keyed by
+  fixture and attribute: `added`, `removed` and `changed` rows with the changed `fields` (`value`, `steps`,
+  `stepValues`, `stepRelative`, `stepWidth`, `stepTransition`, `stepAccel`, `stepDecel`, `stepPresets` (the preset of
+  each step, in step order), `speed`, `phase`, `measure`, `speedMaster`, `relative`, `preset`, `relPreset`, `fade`, `delay`, `cooked`, `part`,
+  and `presetAddr` / `relPresetAddr` / `stepPresetAddrs` when the label is the same but the full address differs, e.g. Preset
+  4.12 "Red" of another data pool; the preset lists then add the address),
+  the presets only one cue references, the cue properties that differ and per part the timing, command, MIB and recipe
+  lines that differ (every recipe property: selection, preset, values, FadeX, DelayX, SpeedX, PhaseX, MAtricks, filter,
+  generator, enabled).
+  Value rows are paged (`offset`, `limit`, default 200). Tracked values are not part of a cue's data and are not
+  compared.
+- **`gma3_tracking_leaks`** `{sequence, from?, to?, min_cues?, require_revisit?}` folds tracking from the stored data
+  in cue order. The heuristic, as the tool states it: a run starts where a fixture/attribute value is stored and counts
+  each later cue it is still effective in. It ends at a cue that stores the attribute again (restated, blocked or
+  cooked), at a cue with Release Yes, at a cue with a Break, or at an unread cue. A Break that reads empty, "None" or
+  `#FFFFFFFFFFFFFFFF` (how onPC 2.5.1 reads a cue without one) is no Break. A Break's filter or world is not
+  evaluated, so the run is counted only up to the cue before it, and `uncertain` says so. A run is a candidate when
+  it tracks through at least `min_cues` cues (default 2) and, with `require_revisit` (default true), at least one of
+  them stores another attribute of the same (sub)fixture without restating this one. Values stored in a part that has a
+  TrackingDistance are excluded and counted; the cue's other parts are not. `notEvaluated` counts the runs cut at a Break and excluded for a
+  TrackingDistance, and `uncertain` quotes the texts read for them; with none found but some not evaluated, the summary
+  says so instead of "no candidate". A sequence with Tracking off has no leaks. Each candidate has
+  `storedIn`, `value`, `trackedThrough`, `lastEffective`, `revisitedIn` and `endedBy`. Candidates are sorted by
+  revisits, then by length. A candidate may be intended. Released values stored as such and the wrap-around of a
+  looping sequence are not modelled.
+
+Each cue costs one `cueContents` and one `preset.read` per part with data, so scans are bounded: `max_cues` (300 for
+usages, 500 for leaks), `max_seconds` (90) and `max_results` (100 rows; the counts stay complete for what was
+scanned). The budget is checked before each sequence listing as well as before each cue. A stopped usage scan returns
+`next.resume` to pass back as `resume` (`cue: "0.001"` for a sequence not listed yet: from its first cue). A leak scan is narrowed with `from`/`to`.
+Values stored before `from` are unknown. `complete: false` with `reasons` covers a budget stop, a failed
+`cueContents` or `preset.read`, a part with more than 5000 values (`truncated`), a part without a per-fixture table,
+an incomplete or changed listing, an incomplete executor scan, a requested sequence that does not exist and a bridge older than 0.47.0 (listings
+cannot be confirmed) or 0.24.0 (no part data). An incomplete result never says "no usage", "no dangling reference"
+or "no leaks": its summary says the scan proves nothing for what was not read, and `unread` lists the first 20 cues
+or parts that were not read. A call is an error only when nothing could be read (the sequence pool or the sequence),
+for a missing preset (use `dangling: true` to find references to deleted presets) and for invalid arguments. The
+reply lists one row per line. `data_pool` reads another data pool.
+
 ### Build staleness
 
 `npm run build` writes `dist/build-info.json` with a hash of `src/**`, `package-lock.json` and
@@ -189,6 +278,42 @@ instead of working around missing tools with `gma3_lua` or `gma3_command`. The s
 says the same. Changes outside the hashed inputs (docs, the Lua plugin) do not make the build stale. A
 build made before this check existed has no stamp and no check, so it cannot report itself.
 
+### Long calls: progress and client timeouts
+
+A big build call (100 recipe cue parts and their cook, a 256-fixture patch, a 64-preset phaser build, a long timecode
+show) can run for minutes while the console works. If the client gives up first, the console still finishes: the
+answer is lost, not the work (#145). Three things keep that from turning into a resend:
+
+- **Progress.** When the client sends a `progressToken` with `tools/call`, the server sends
+  `notifications/progress` while the call runs: one unit per finished batch item (`gma3_store_cues`,
+  `gma3_store_recipe_cues` and every list tool), per cooked cue part, per built phaser preset, per timecode track and
+  per cue stored in a Preview build, each with a message naming it; and between units a fraction for every bridge
+  request, and every 5 s while one request waits for the console (a cook, a patch edit). The value always increases;
+  `total` is sent while it is known (a call that writes 72 cue parts and cooks them reports 0..72 of 72, then 72..144
+  of 144). Without a token nothing is sent.
+- **Bounded requests.** A timecode track's events go to the bridge 100 per request (`TC_EVENTS_PER_REQUEST`), in time
+  order. Recipe lines are already a few requests each. A patch edit (`gma3_patch_add`, `_set`, `_remove`, at most 256
+  fixtures) stays one request on purpose: the bridge undoes a failed add in the copy and resolves address swaps within
+  one request, so it is not split; its reply wait scales with the fixtures and it beats while it waits.
+- **Already done.** `gma3_store_recipe_cues` in `replace` mode reads each cue part first; one whose lines (group,
+  values, MAtricks, Enabled, the name and selection mode when given, the per-line columns), cue name and note already
+  read as the call asks is answered `already done` and nothing is sent for it, so sending the same call again after a
+  lost answer does not rewrite it. `append` cannot tell a repeat from a wanted second copy and always writes: use
+  `replace` for a build that may be sent again. When an answer is lost on any other tool, read the result
+  (`gma3_cue_contents`, `gma3_recipes`, `gma3_patch_list`) before deciding to send again.
+
+Set the client's tool-call timeout for big builds to at least 10 minutes, and let it reset on progress where the
+client supports it:
+
+| Client | Setting |
+| --- | --- |
+| Claude Code | `MCP_TOOL_TIMEOUT=600000` (ms) in the environment the client starts with |
+| MCP TypeScript SDK | `client.callTool(params, undefined, { onprogress, resetTimeoutOnProgress: true, timeout: 120000, maxTotalTimeout: 1800000 })` |
+| Others | the client's per-tool or request timeout; check whether it resets on `notifications/progress` |
+
+Splitting a build over more, smaller calls (for example 20 cue parts per `gma3_store_recipe_cues` call) also keeps
+each answer short.
+
 ## Workflow tools
 
 The tools above are thin wrappers over single bridge requests and keep their original responses. The
@@ -198,13 +323,19 @@ whether to continue, inspect console state, or stop:
 ```jsonc
 {
   "operation": "store_cue",
-  "target": { "sequence": 1, "cue": "2.5" },
   "outcome": "succeeded",              // succeeded | failed | partial | unknown
+  "summary": "store_cue succeeded. read-back matched.",
+  "target": { "sequence": 1, "cue": "2.5" },
   "verification": { "status": "matched" },  // matched | mismatched | unavailable | not_requested
-  "steps": [ { "name": "store", "status": "succeeded", "op": "cmd", "command": "Store Sequence 1 Cue 2.5 /NoConfirmation", "feedback": "OK" } ],
-  "summary": "store_cue succeeded. read-back matched."
+  "steps": [ { "name": "store", "status": "succeeded", "op": "cmd", "command": "Store Sequence 1 Cue 2.5 /NoConfirmation", "feedback": "OK" } ]
 }
 ```
+
+* The result is serialised answer first, because MCP clients shorten a long result by cutting out its middle:
+  `operation`, `outcome`, `summary`, then `failure` when a step failed or got no reply (`{step, status, op?, error?}`
+  of the first such step), `warnings` / `validationErrors`, the fields with plain values (`committed`,
+  `copyLeftOpen`, ...), `target`, `verification`, the other structured fields, and `steps` last. The fields are the
+  same as before; only `failure` is new, and it repeats the step's own data.
 
 * Recognised negative command-line feedback (`Syntax Error`, `Illegal Command`, `... does not exist`, ...) is a
   failure. Feedback the server does not recognise makes the step `unknown`; it is never assumed to be success.
@@ -289,7 +420,7 @@ Ops: `ping`, `cmd`, `lua`, `object`, `children`, `objects`, `dump`, `set`, `setf
 `input.status` and the fake-backend test control `input.fake` (below), since v0.6.0 `input.combo` (below), and since
 v0.7.0 the interaction and sequence ops `input.begin`, `input.extend`, `input.end`, `input.sequence`,
 `input.sequence.status`, `input.sequence.abort` ([below](#interactions-admission-text-and-sequences-plugin-v070-kb-05)), and since
-v0.8.0 the read-only feedback ops `feedback.describe` and `feedback.read` ([below](#console-feedback-plugin-v080-kb-06)), v0.13.0 `feedback.context`, `feedback.watch` and `feedback.unwatch` ([below](#control-context-plugin-v0130-kb-17)), and v0.14.0 the continuous-control ops `control.bind`, `control.open`, `control.renew`, `control.close`, `control.submit`, `control.status` and `control.recover` ([below](#continuous-control-plugin-v0140-kb-18)), and v0.19.0 the patch ops: reads `patch.state`, `patch.types`, `patch.list`, `patch.check`, `patch.collections` and `patch.fingerprint`, and the guarded, `exclusive`-only `patch.enter`, `patch.add`, `patch.set`, `patch.remove` and `patch.commit` ([tools/patch.md](tools/patch.md)), and since v0.20.0 the page/executor range guard on every op that takes an object reference ([below](#page-and-executor-ranges-plugin-v0200)), and since v0.21.0 the read-only selection-grid ops `group.read` and `selection.grid` ([below](#selection-grid-reads-plugin-v0210-sb-02)), and since v0.22.0 the read-only preset ops `preset.read` and `preset.context` ([below](#preset-reads-plugin-v0220-sb-03)), and since v0.23.0 the programmer's environment and the phaser layers of programmer and preset steps ([below](#phaser-layers-plugin-v0230-sb-04)), and since v0.24.0 cue-part data with cooked flags in `preset.read` ([below](#cue-part-data-plugin-v0240-sb-05)), and since v0.48.0 the read-only `patch.stages` and the guarded, `exclusive`-only `patch.stageEdit`, with `patch.fingerprint`'s `excludeStages` and `bareStages` ([tools/patch.md](tools/patch.md#gma3_patch_stages)). See
+v0.8.0 the read-only feedback ops `feedback.describe` and `feedback.read` ([below](#console-feedback-plugin-v080-kb-06)), v0.13.0 `feedback.context`, `feedback.watch` and `feedback.unwatch` ([below](#control-context-plugin-v0130-kb-17)), and v0.14.0 the continuous-control ops `control.bind`, `control.open`, `control.renew`, `control.close`, `control.submit`, `control.status` and `control.recover` ([below](#continuous-control-plugin-v0140-kb-18)), and v0.19.0 the patch ops: reads `patch.state`, `patch.types`, `patch.list`, `patch.check`, `patch.collections` and `patch.fingerprint`, and the guarded, `exclusive`-only `patch.enter`, `patch.add`, `patch.set`, `patch.remove` and `patch.commit` ([tools/patch.md](tools/patch.md)), and since v0.20.0 the page/executor range guard on every op that takes an object reference ([below](#page-and-executor-ranges-plugin-v0200)), and since v0.21.0 the read-only selection-grid ops `group.read` and `selection.grid` ([below](#selection-grid-reads-plugin-v0210-sb-02)), and since v0.22.0 the read-only preset ops `preset.read` and `preset.context` ([below](#preset-reads-plugin-v0220-sb-03)), and since v0.23.0 the programmer's environment and the phaser layers of programmer and preset steps ([below](#phaser-layers-plugin-v0230-sb-04)), and since v0.24.0 cue-part data with cooked flags in `preset.read` ([below](#cue-part-data-plugin-v0240-sb-05)), and since v0.48.0 the read-only `patch.stages` and the guarded, `exclusive`-only `patch.stageEdit`, with `patch.fingerprint`'s `excludeStages` and `bareStages` ([tools/patch.md](tools/patch.md#gma3_patch_stages)), and since v0.58.0 `patch.check`'s `ranges` (FIDs and DMX ranges of fixtures not in the show yet, [tools/mvr.md](tools/mvr.md)). See
 [`plugin/gma3_mcp_bridge.lua`](../plugin/gma3_mcp_bridge.lua).
 
 Error replies are `{"id", "ok": false, "error": "[code] message"}`; since v0.7.0 they also carry `code` (the bracketed
@@ -328,7 +459,7 @@ Evidence: [probes/objectlist-hang-macos-2.5.1.md](probes/objectlist-hang-macos-2
 
 ### ViewButton lookups (plugin v0.50.1)
 
-The bridge refuses references containing `ViewButton` (shortcut `ViewB`) and a range, list or wildcard with
+This guard is the one difference between bridge 0.58.1 and 0.58.0. The bridge refuses references containing `ViewButton` (shortcut `ViewB`) and a range, list or wildcard with
 `[unsafe-range]` before calling `ObjectList`. This also covers mixed expressions such as
 `View 53 Thru 59 + ViewButton 1.15 Thru 1.20`. Use a separate single reference for each button, for example
 `gma3_get_object` with `ViewButton 1.15` followed by `ViewButton 1.16`. Stored views are separate objects.
@@ -427,6 +558,12 @@ carries `class` (`"Preset"` or `"Part"`), and every row has `cooked` (true when 
 `mask_cooked` non-zero; 511 on 2.5.1). Recipe lines themselves are read and written with `children` / `objects`
 (`asText: false` for their Selection, Values, MAtricks and Filter handles) and `set`. Tools:
 [tools/recipes.md](tools/recipes.md).
+
+### Edit Recipe mode (plugin v0.52.0; v0.52.1)
+
+- `recipe.editState` (read-only) → `{environment, editing, editingRaw, partZeroLines: [{index, class, name}], partZero, modal, modalError?, lastCommand}`: the current environment's `RecipeEditor.RecipeEditing`, the recipe lines in the programmer's Part Zero, the top dialog. A programmer without a Part Zero (seen live with phaser values in it) reads `partZero: false` and no line; before v0.52.1 it was an error (`no-part-zero`).
+- `recipe.editBegin {target, exclusive: true}` queues `EditRecipe <target>` with `CmdIndirect` (target `Preset P.N` or `Sequence S Cue C Part P` only). Refused (`not-exclusive`, `bad-args`, `modal-unknown`, `modal-open`, `editing-on`, `part-zero-busy`) before anything is queued. Queued, because "Update last object?" opened by a `Cmd()` on the plugin thread stalls the bridge; the server polls `recipe.editState`.
+- `recipe.editEnd {exclusive: true}` queues the `EditRecipe` toggle, only while the mode reads on (`editing-off` otherwise) and no dialog is open.
 
 ### Timecode shows (plugin v0.25.0, SB-08)
 

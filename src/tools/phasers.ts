@@ -31,6 +31,7 @@
  *     that programmer; `Preview Off` returns to Normal with its programmer as it was. Blind keeps the Normal programmer
  *     and its state cannot be read, so it is not used.
  */
+import { progressSteps } from "../progress.js";
 import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import { operation, type RegisterTools, type ToolContext } from "./context.js";
@@ -489,9 +490,11 @@ function expectedPercent(v: number, kind: "absolute" | "relative", unit: Unit, r
   const from = row.physicalFrom;
   const to = row.physicalTo;
   if (typeof from !== "number" || typeof to !== "number" || to === from) return `the physical range of ${row.attribute} is unknown`;
+  // Absolute programmer/preset values follow the ascending UI physical range, not DMX direction (captured onPC
+  // 2.5.1.1 Ultra Zoom 50.2 -> 6.6: Physical 25 reads 42.2018 %), as gma3_set_attributes read-back already assumes.
   // A relative value is a share of the range's size: a fixture with a reversed range (from > to) still reads +30° as
   // a positive percentage (Thrill Mini Profile Pan, SB-04 probe).
-  return kind === "absolute" ? ((v - from) / (to - from)) * 100 : (v / Math.abs(to - from)) * 100;
+  return kind === "absolute" ? ((v - Math.min(from, to)) / Math.abs(to - from)) * 100 : (v / Math.abs(to - from)) * 100;
 }
 
 const near = (a: unknown, b: unknown, tol: number) => typeof a === "number" && typeof b === "number" && Math.abs(a - b) <= tol;
@@ -1160,6 +1163,7 @@ export async function buildPhaser(ctx: ToolContext, raw: BuildArgs): Promise<Ope
     // 2. Build every job in one Preview session.
     const steps: StepResult[] = [...inspect.steps];
     let entered = false;
+    const progress = progressSteps(reports.length);
     try {
       const enter = await commandStep(bridge, "preview_on", "Preview On", t);
       steps.push(enter);
@@ -1261,11 +1265,13 @@ export async function buildPhaser(ctx: ToolContext, raw: BuildArgs): Promise<Ope
         steps.push(...run.steps);
         rep.steps = run.steps;
         rep.status = "built";
+        progress.step(`build_phaser: preset ${i + 1} of ${reports.length} (${job.ref}) ${run.outcome}`);
         // A failed effect does not stop the others; an unknown step (or leaving Preview) stops the build.
         const bad = run.steps.find((s) => s.status === "unknown" || (s.name === `${P}confirm_preview` && s.status !== "succeeded"));
         if (bad) ready = false;
       }
     } finally {
+      progress.end();
       // Leave the Preview environment whatever happened, once it may have been entered. ClearAll is sent only after
       // the console confirms it is in Preview: in Normal it would discard the operator's programmer.
       if (entered) {

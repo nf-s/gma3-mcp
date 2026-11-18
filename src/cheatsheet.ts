@@ -41,12 +41,18 @@ Executors are addressed by page: "Page 1.201" or "Executor 201" (current page). 
 ## Patch and show
 - Patch Fixture 1 1.1          patch to universe 1 address 1 (Edit Patch menu for full control)
 - Fixture 1 Thru 10 Property "Name" "Spot %"
-- SaveShow / SaveShow "Name" / LoadShow "Name" / NewShow   (save with gma3_save_show: a dialog from a raw command stalls the bridge)
+- SaveShow / SaveShow "Name" / LoadShow "Name" / NewShow   (save with gma3_save_show, load with gma3_load_show: a dialog from a raw command stalls the bridge, and LoadShow stops it)
 - List, Dump                   print to the command line history (not returned over the bridge)
 - Menu "Patch" / Menu "Settings" / Menu "DisplayConfig"
 - Lua "Printf('hi')"           run inline Lua from the command line
 - Plugin "name" "argument"     run a plugin
 - SendOSC 1 "/path,i,1"        send OSC from line 1 of the OSC configuration
+
+## Show analysis (structured, read-only tools: no command line or Lua needed)
+- Where is Preset 4.12 used, and by which executors?   gma3_preset_usage {preset: "4.12"}
+- Invalid preset references in cue data               gma3_preset_usage {dangling: true}
+- What differs between two cues (stored data)          gma3_cue_diff {a: {sequence, cue}, b: {sequence, cue}}
+- Values that keep tracking unintentionally            gma3_tracking_leaks {sequence}
 
 ## Show data paths (for gma3_get_object / gma3_lua)
 Root

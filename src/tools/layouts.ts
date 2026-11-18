@@ -1,520 +1,685 @@
-/** General Layout pool authoring. Uses structured bridge operations; never invokes assigned objects. */
+/**
+ * #146: Layouts, the 2D views of the Layout pool (DataPool.Layouts) where groups, sequences, macros, presets and other
+ * pool objects sit as elements for touch busking.
+ *
+ * What is known (onPC 2.5.1.1, 2026-11-17, read-only, and MA's own resources shipped with the console):
+ *
+ *   - Layout 1 "Default" is class Layout with layout-level properties (PositionX/Y, DimensionW/H, RenderStyle, ...);
+ *     its elements are its children.
+ *   - MA's system test lib_plugins/systemtests/db/system_test_layout_copy_element.lua builds an element with
+ *     `Assign Sequence 1 At <layout>` (the element becomes the layout's last child) and sets PositionX/Y, Width, Height,
+ *     Action, Appearance, CustomTextText, CustomTextColor on it; system_test_helping_functions_layout.lua sets POSX,
+ *     POSY, WIDTH, HEIGHT, CUSTOMTEXT*, VISIBILITYOBJECTNAME / VISIBILITYBORDER ("Visible" / "Hidden") in Lua.
+ *   - The element editor (lib_menus/ui/editors/layout_element_editor.uixml) edits Object, Action, Appearance, PosX, PosY,
+ *     Width, Height, CustomTextText/Size/Color/AlignmentH/AlignmentV, Visibility* and Name.
+ *
+ * Not probed on a console: that Assign onto an empty layout slot creates the layout (the manual says so for fixtures
+ * assigned from the pool), and how each Visibility* property reads back. The tool therefore reads everything back and
+ * never claims a match it did not see.
+ *
+ *   gma3_layouts       read-only: the Layout pool, or one layout's elements (object, position, size, text, visibility)
+ *   gma3_store_layout  create (or append to, or rebuild) a layout from a list of elements and/or a grid of a range
+ *
+ * No new bridge op: Assign / Delete go through cmd, element properties through set (both refused while another client
+ * owns input), reads through objects and children (asText false gives the element's Object as {class, name, addr}).
+ */
 import { z } from "zod";
-import type { Gma3Bridge } from "../bridge.js";
-import { asRead, buildResult, commandStep, notRequested, requestStep, runSteps, stepFromError, unavailable, validationFailure, valuesEqual, type OperationResult, type StepResult, type Verification } from "../results.js";
-import { objectName, noteText, Validator } from "../validate.js";
-import { isNotFoundError } from "./common.js";
+import { asRead, buildResult, commandStep, stepFromError, unavailable, validationFailure, type OperationResult, type StepResult, type Verification } from "../results.js";
+import { readObjects } from "./common.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
-import { inDataPool } from "./datapool.js";
-import { lockState } from "./playback.js";
-import { checkPoolName } from "./poolnames.js";
+import { checkPoolName, ON_NAME_TAKEN, type OnNameTaken, type PoolNameCache, nameOrSuffixed } from "./poolnames.js";
 
-const numberSchema = z.number().int().min(1).max(9999);
-const coordinateSchema = z.number().int().min(-32768).max(32767);
-const dimensionSchema = z.number().int().min(1).max(32767);
-// The Lua JSON library serialises an empty table as []; only that empty form is a field map.
-const fieldSchema = z.preprocess((value) => Array.isArray(value) && value.length === 0 ? {} : value, z.record(z.string(), z.unknown()));
-const summarySchema = z.object({
-  name: z.string().optional(), class: z.string().optional(), addr: z.string().optional(), index: z.number().int().optional(), childCount: z.number().int().optional(), invalid: z.boolean().optional(), fields: fieldSchema.optional(), fieldErrors: fieldSchema.optional(),
-}).passthrough();
-const listingSchema = z.object({ total: z.number().int().nonnegative(), offset: z.number().int().nonnegative().optional(), items: z.array(summarySchema), enumerationError: z.unknown().optional() }).passthrough();
-const propertySchema = z.object({ name: z.string(), readOnly: z.boolean().optional(), type: z.string().optional(), enum: z.string().optional() }).passthrough();
-const objectSchema = summarySchema.extend({ properties: fieldSchema.optional(), schema: z.array(propertySchema).optional() });
-const setReplySchema = z.object({ value: z.unknown().optional(), exact: z.unknown().optional(), readOk: z.boolean().optional(), readError: z.unknown().optional() }).passthrough();
-type Summary = z.infer<typeof summarySchema>;
-type ObjectRead = z.infer<typeof objectSchema>;
+/** Pool keywords an element may show (one object per element). */
+const KEYWORDS: Record<string, string> = {
+  group: "Group",
+  sequence: "Sequence",
+  seq: "Sequence",
+  macro: "Macro",
+  preset: "Preset",
+  matricks: "MAtricks",
+  quickey: "Quickey",
+  world: "World",
+  view: "View",
+  plugin: "Plugin",
+  fixture: "Fixture",
+  timecode: "Timecode",
+  timer: "Timer",
+};
 
-export const LAYOUT_FIELDS = ["No", "Name", "Note", "GUID", "Lock", "StructureLocked", "SystemLocked", "PositionX", "PositionY", "DimensionW", "DimensionH", "Appearance", "CanvasAppearance", "ViewPosActive", "ViewPosScale", "ViewPosX", "ViewPosY", "Markers", "ValueColors"];
-export const ELEMENT_FIELDS = ["No", "Name", "GUID", "Lock", "StructureLocked", "SystemLocked", "Object", "Action", "PosX", "PosY", "Width", "Height", "Appearance", "CustomTextText", "CustomTextColor", "CustomTextSize", "CustomTextAlignmentH", "CustomTextAlignmentV", "CustomTextVertical", "VisibilityElement", "VisibilityObjectName", "VisibilityID", "VisibilityCID", "VisibilityBar", "VisibilityValue", "VisibilityIcon", "VisibilityIndicatorBar", "VisibilityBorder"];
-const MAX_ELEMENTS = 10000;
-const MAX_EDITS = 100;
-const layoutRef = (layout: number) => `Layout ${layout}`;
-const elementRef = (layout: number, element: number) => `Layout ${layout}.${element}`;
-const upperFields = (fields: Record<string, unknown> = {}) => Object.fromEntries(Object.entries(fields).map(([key, value]) => [key.toUpperCase(), value]));
-const field = (item: Summary, name: string): unknown => upperFields(item.fields)[name.toUpperCase()];
-const stringValue = (value: unknown): string | undefined => typeof value === "string" && value.trim() ? value.trim() : undefined;
+export const MAX_ELEMENTS = 200;
+const ALIGN_H = ["Left", "Center", "Right", "OutsideLeft", "OutsideRight"] as const;
+const ALIGN_V = ["Top", "Center", "Bottom", "Above", "Below"] as const;
+const TEXT_SIZES = ["Default", "10", "12", "14", "16", "18", "20", "24", "28", "32"] as const;
 
-async function listing(bridge: Gma3Bridge, ref: string, fields: string[], limit: number, offset: number, t: number, asText = true) {
-  const result = listingSchema.parse(await bridge.request("children", { ref, fields, limit, offset, asText }, t));
-  if (result.enumerationError !== undefined && result.enumerationError !== null) throw new Error(`Cannot list ${ref}: ${String(result.enumerationError)}`);
-  for (const item of result.items) {
-    if (item.invalid) throw new Error(`${ref} contains an invalid object; inspect again before editing`);
-    if (item.fieldErrors && Object.keys(item.fieldErrors).length) throw new Error(`${ref} has unreadable fields: ${JSON.stringify(item.fieldErrors)}`);
+/** Highest object number per keyword: pool objects go to 9999, fixture IDs further. */
+const maxNumber = (keyword: string) => (keyword === "Fixture" ? 99999999 : 9999);
+
+/** A parsed number, refused unless it is a whole number from 1 to `max` (no Infinity or unsafe integers). */
+function objectNumber(text: string, what: string, max: number): number {
+  const n = Number(text);
+  if (!Number.isSafeInteger(n) || n < 1 || n > max) throw new Error(`${what}: ${text.length > 12 ? `${text.slice(0, 12)}...` : text} is not a number from 1 to ${max}`);
+  return n;
+}
+
+/** A parsed element object: the command-line reference the Assign uses. */
+export interface ObjectRef {
+  keyword: string;
+  ref: string;
+}
+
+/** "Group 5", "seq 3", "Preset 4.12", "Fixture 101" or "Fixture 101.3" -> its command-line reference. */
+export function parseObject(raw: string): ObjectRef {
+  const m = raw.trim().match(/^([A-Za-z]+)\s+(\d+)(?:\.(\d+))?$/);
+  if (!m) throw new Error(`${JSON.stringify(raw)} is not one object ("Group 5", "Sequence 3", "Preset 4.12", "Fixture 101"); give one object per element, ranges go in grid.objects`);
+  const keyword = KEYWORDS[m[1].toLowerCase()];
+  if (!keyword) throw new Error(`${JSON.stringify(raw)}: ${m[1]} is not an object a layout element shows here (${[...new Set(Object.values(KEYWORDS))].join(", ")})`);
+  const a = objectNumber(m[2], JSON.stringify(raw), keyword === "Preset" ? 9999 : maxNumber(keyword));
+  const b = m[3] !== undefined ? objectNumber(m[3], JSON.stringify(raw), 9999) : undefined;
+  if (keyword === "Preset") {
+    if (b === undefined) throw new Error(`${JSON.stringify(raw)}: a preset is "Preset <pool>.<number>", e.g. "Preset 4.12"`);
+    return { keyword, ref: `Preset ${a}.${b}` };
   }
-  return result;
+  if (b !== undefined && keyword !== "Fixture") throw new Error(`${JSON.stringify(raw)}: ${keyword} takes a whole number`);
+  return { keyword, ref: `${keyword} ${a}${b !== undefined ? `.${b}` : ""}` };
 }
-async function one(bridge: Gma3Bridge, ref: string, fields: string[], t: number, asText = true): Promise<Summary | null> {
-  try {
-    const result = listingSchema.parse(await bridge.request("objects", { ref, fields, limit: 1, asText }, t));
-    const item = result.items[0];
-    if (!item || item.invalid) return null;
-    if (item.fieldErrors && Object.keys(item.fieldErrors).length) throw new Error(`${ref} has unreadable fields: ${JSON.stringify(item.fieldErrors)}`);
-    return item;
-  } catch (err) { if (isNotFoundError(err)) return null; throw err; }
+
+/** "Sequence 1 Thru 12" / "Preset 4.1 Thru 4.8" / "Group 3 + 5 + 9" -> the single references, in order. */
+export function expandRange(raw: string): ObjectRef[] {
+  const s = raw.trim();
+  const thru = s.match(/^([A-Za-z]+)\s+(\d+)(?:\.(\d+))?\s+thru\s+(?:(\d+)\.)?(\d+)$/i);
+  if (thru) {
+    const keyword = KEYWORDS[thru[1].toLowerCase()];
+    if (!keyword) throw new Error(`grid.objects: ${thru[1]} is not an object a layout element shows here`);
+    const isPreset = keyword === "Preset";
+    if (isPreset && thru[3] === undefined) throw new Error('grid.objects: a preset range is "Preset <pool>.<a> Thru <b>" (or Thru <pool>.<b>)');
+    if (!isPreset && (thru[3] !== undefined || thru[4] !== undefined)) throw new Error(`grid.objects: a ${keyword} range is "${keyword} <a> Thru <b>"`);
+    // Every number is a bounded safe integer before the loop below counts from one to the other.
+    const max = isPreset ? 9999 : maxNumber(keyword);
+    const pool = objectNumber(thru[2], "grid.objects", max);
+    if (isPreset && thru[4] !== undefined && objectNumber(thru[4], "grid.objects", 9999) !== pool) throw new Error("grid.objects: a preset range stays in one preset pool");
+    const from = isPreset ? objectNumber(thru[3], "grid.objects", 9999) : pool;
+    const to = objectNumber(thru[5], "grid.objects", max);
+    if (to < from) throw new Error("grid.objects: the range must go upwards");
+    if (to - from + 1 > MAX_ELEMENTS) throw new Error(`grid.objects: at most ${MAX_ELEMENTS} objects`);
+    const out: ObjectRef[] = [];
+    for (let n = from; n <= to; n++) out.push({ keyword, ref: isPreset ? `Preset ${pool}.${n}` : `${keyword} ${n}` });
+    return out;
+  }
+  if (s.includes("+")) {
+    const parts = s.split("+").map((p) => p.trim());
+    const first = parseObject(parts[0]);
+    const pool = first.keyword === "Preset" ? first.ref.split(" ")[1].split(".")[0] : "";
+    const rest = parts.slice(1).map((p) => {
+      if (/^[A-Za-z]/.test(p)) return parseObject(p);
+      if (first.keyword === "Preset") return parseObject(`Preset ${p.includes(".") ? p : `${pool}.${p}`}`);
+      return parseObject(`${first.keyword} ${p}`);
+    });
+    if (1 + rest.length > MAX_ELEMENTS) throw new Error(`grid.objects: at most ${MAX_ELEMENTS} objects`);
+    return [first, ...rest];
+  }
+  return [parseObject(s)];
 }
-async function schemaRead(bridge: Gma3Bridge, ref: string, t: number): Promise<ObjectRead> {
-  const result = objectSchema.parse(await bridge.request("object", { ref, schema: true, properties: true, asText: false }, t));
-  if (result.invalid) throw new Error(`${ref} is invalid`);
-  return result;
+
+export interface ElementArgs {
+  object: string;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  text?: string;
+  name?: string;
+  action?: string;
+  appearance?: string;
+  show_name?: boolean;
+  show_id?: boolean;
+  border?: boolean;
+  bar?: boolean;
+  value?: boolean;
+  text_size?: string;
+  text_color?: string;
+  align_h?: string;
+  align_v?: string;
 }
-async function elementPage(bridge: Gma3Bridge, layout: number, limit: number, offset: number, t: number) {
-  const display = await listing(bridge, layoutRef(layout), ELEMENT_FIELDS, limit, offset, t);
-  const handles = await listing(bridge, layoutRef(layout), ["Object"], limit, offset, t, false);
-  if (display.total !== handles.total || display.items.length !== handles.items.length) throw new Error("Layout changed between GUID and object-handle reads; inspect again");
-  const items = display.items.map((item, index) => {
-    const typed = handles.items[index];
-    if (!typed || typed.addr !== item.addr || typed.index !== item.index) throw new Error("Layout element addresses changed between reads; inspect again");
-    return { ...item, fields: { ...item.fields, Object: field(typed, "Object") } };
+
+interface GridArgs {
+  objects: string;
+  columns: number;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  gap?: number;
+  skip_missing?: boolean;
+}
+
+export interface StoreLayoutArgs {
+  layout: number;
+  name?: string;
+  on_name_taken?: OnNameTaken;
+  elements?: ElementArgs[];
+  grid?: GridArgs;
+  overwrite?: boolean;
+  append?: boolean;
+  preview?: boolean;
+}
+
+/** Element property -> console property, how it is written and how a read-back is compared. */
+interface PropSpec {
+  key: keyof ElementArgs;
+  prop: string;
+  kind: "number" | "text" | "bool" | "color" | "enum";
+}
+const PROPS: PropSpec[] = [
+  { key: "x", prop: "PosX", kind: "number" },
+  { key: "y", prop: "PosY", kind: "number" },
+  { key: "width", prop: "Width", kind: "number" },
+  { key: "height", prop: "Height", kind: "number" },
+  { key: "name", prop: "Name", kind: "text" },
+  { key: "text", prop: "CustomTextText", kind: "text" },
+  { key: "action", prop: "Action", kind: "enum" },
+  { key: "appearance", prop: "Appearance", kind: "text" },
+  { key: "show_name", prop: "VisibilityObjectName", kind: "bool" },
+  { key: "show_id", prop: "VisibilityID", kind: "bool" },
+  { key: "border", prop: "VisibilityBorder", kind: "bool" },
+  { key: "bar", prop: "VisibilityBar", kind: "bool" },
+  { key: "value", prop: "VisibilityValue", kind: "bool" },
+  { key: "text_size", prop: "CustomTextSize", kind: "enum" },
+  { key: "text_color", prop: "CustomTextColor", kind: "color" },
+  { key: "align_h", prop: "CustomTextAlignmentH", kind: "enum" },
+  { key: "align_v", prop: "CustomTextAlignmentV", kind: "enum" },
+];
+/** Read with asText false: the object as {class, name, addr}, the geometry as numbers. */
+const RAW_FIELDS = ["Object", "PosX", "PosY", "Width", "Height"];
+/** Read as display text. */
+const TEXT_FIELDS = ["Name", "CustomTextText", "Action", "Appearance", "VisibilityObjectName", "VisibilityID", "VisibilityBorder", "VisibilityBar", "VisibilityValue", "CustomTextSize", "CustomTextColor", "CustomTextAlignmentH", "CustomTextAlignmentV"];
+
+const written = (spec: PropSpec, v: unknown): string => {
+  if (spec.kind === "bool") return v ? "Visible" : "Hidden";
+  if (spec.kind === "color") return String(v).toUpperCase();
+  return String(v);
+};
+
+/** "Visible" / "On" / "Yes" -> true, "Hidden" / "Off" / "No" -> false, anything else null. */
+export function visibility(v: unknown): boolean | null {
+  if (typeof v === "boolean") return v;
+  const s = String(v ?? "").trim().toLowerCase();
+  if (/^(visible|on|yes|true|1)$/.test(s)) return true;
+  if (/^(hidden|off|no|false|0)$/.test(s)) return false;
+  return null;
+}
+
+/** Whether a read-back value is the one asked for. */
+export function propMatches(spec: PropSpec, want: unknown, got: unknown): boolean {
+  if (got === undefined || got === null) return false;
+  switch (spec.kind) {
+    case "number":
+      return Number(got) === Number(want);
+    case "bool":
+      return visibility(got) === want;
+    case "color":
+      return String(got).trim().replace(/^#/, "").toUpperCase() === String(want).replace(/^#/, "").toUpperCase();
+    case "text":
+      // The bridge trims what it reads back.
+      return String(got).trim() === String(want).trim();
+    default:
+      return String(got).trim().toLowerCase() === String(want).trim().toLowerCase();
+  }
+}
+
+/** One element as read: index, its object and properties. */
+export interface ElementRead {
+  index: number;
+  addr?: string;
+  class?: string;
+  object?: { class?: string; name?: string; addr?: string } | null;
+  props: Record<string, unknown>;
+  fieldErrors?: Record<string, unknown>;
+}
+
+type ChildItem = { name?: string; class?: string; addr?: string; index?: number; invalid?: boolean; fields?: Record<string, unknown>; fieldErrors?: Record<string, unknown> };
+type ChildList = { total?: number; items?: ChildItem[]; enumerationError?: unknown };
+
+const PAGE = 500;
+
+/** Read a layout's elements from `offset` on (all by default): two children reads per page, merged by position. */
+export async function readElements(ctx: ToolContext, layout: number, from = 0, t = ctx.requestTimeoutMs): Promise<{ total: number; elements: ElementRead[]; complete: boolean; error?: string }> {
+  const elements: ElementRead[] = [];
+  let total = 0;
+  for (let offset = from; ; offset += PAGE) {
+    const raw = (await ctx.bridge.request("children", { ref: `Layout ${layout}`, fields: RAW_FIELDS, asText: false, limit: PAGE, offset }, t)) as ChildList;
+    const text = (await ctx.bridge.request("children", { ref: `Layout ${layout}`, fields: TEXT_FIELDS, limit: PAGE, offset }, t)) as ChildList;
+    for (const r of [raw, text]) {
+      if (r?.enumerationError !== undefined && r.enumerationError !== null) return { total, elements, complete: false, error: `the elements of Layout ${layout} could not be listed: ${String(r.enumerationError)}` };
+    }
+    total = Number(raw?.total ?? 0);
+    const ri = raw?.items ?? [];
+    const ti = text?.items ?? [];
+    if (ri.length !== ti.length || Number(text?.total ?? 0) !== total) return { total, elements, complete: false, error: `Layout ${layout} changed while it was read (${ri.length} / ${ti.length} elements)` };
+    ri.forEach((item, i) => {
+      const t2 = ti[i];
+      const obj = item.fields?.Object as { class?: string; name?: string; addr?: string } | undefined;
+      const props: Record<string, unknown> = {};
+      for (const k of RAW_FIELDS.slice(1)) if (item.fields?.[k] !== undefined) props[k] = item.fields[k];
+      for (const k of TEXT_FIELDS) if (t2?.fields?.[k] !== undefined) props[k] = t2.fields[k];
+      const errs = { ...(item.fieldErrors ?? {}), ...(t2?.fieldErrors ?? {}) };
+      elements.push({
+        index: offset + i + 1,
+        addr: item.addr,
+        class: item.class,
+        object: obj && typeof obj === "object" ? { class: obj.class, name: obj.name, addr: obj.addr } : null,
+        props,
+        ...(Object.keys(errs).length ? { fieldErrors: errs } : {}),
+      });
+    });
+    if (ri.length < PAGE || offset + ri.length >= total) break;
+  }
+  return { total, elements, complete: elements.length === Math.max(0, total - from) };
+}
+
+const LAYOUT_POOL = { ref: "DataPool.Layouts", noun: "layout", plural: "layouts", label: (n: number) => `Layout ${n}` };
+
+interface PlannedElement {
+  source: "elements" | "grid";
+  args: ElementArgs;
+  ref: string;
+  /** The object as the pre-check read it. */
+  target?: { class?: string; name?: string; addr?: string };
+}
+
+function checkElement(e: ElementArgs, where: string, errors: string[]): void {
+  for (const k of ["x", "y"] as const) if (e[k] !== undefined && (!Number.isInteger(e[k]) || Math.abs(e[k]!) > 32000)) errors.push(`${where}.${k} must be a whole number from -32000 to 32000`);
+  for (const k of ["width", "height"] as const) if (e[k] !== undefined && (!Number.isInteger(e[k]) || e[k]! < 1 || e[k]! > 32000)) errors.push(`${where}.${k} must be a whole number from 1 to 32000`);
+  for (const k of ["text", "name", "appearance"] as const) {
+    const v = e[k];
+    if (v !== undefined && (v.length > 256 || /["\u0000-\u001f]/.test(v) || (k !== "text" && v === ""))) errors.push(`${where}.${k} must be ${k === "text" ? "" : "1 to "}256 characters without quotes or control characters`);
+  }
+  if (e.action !== undefined && !/^[A-Za-z][A-Za-z0-9+\- ]{0,40}$/.test(e.action)) errors.push(`${where}.action must be an action name such as "Go+", "Toggle", "SelectFixtures"`);
+  if (e.text_color !== undefined && !/^#?[0-9A-Fa-f]{8}$/.test(e.text_color)) errors.push(`${where}.text_color must be RRGGBBAA hex, e.g. "FFFFFFFF"`);
+  if (e.text_size !== undefined && !TEXT_SIZES.includes(String(e.text_size) as (typeof TEXT_SIZES)[number])) errors.push(`${where}.text_size must be one of ${TEXT_SIZES.join(", ")}`);
+  if (e.align_h !== undefined && !ALIGN_H.some((a) => a.toLowerCase() === e.align_h!.toLowerCase())) errors.push(`${where}.align_h must be one of ${ALIGN_H.join(", ")}`);
+  if (e.align_v !== undefined && !ALIGN_V.some((a) => a.toLowerCase() === e.align_v!.toLowerCase())) errors.push(`${where}.align_v must be one of ${ALIGN_V.join(", ")}`);
+}
+
+/** The grid's elements: row-major from (x, y), each width x height, gap apart; y grows downwards as rows are added. */
+export function gridElements(g: GridArgs, refs: ObjectRef[]): ElementArgs[] {
+  const w = g.width ?? 100;
+  const h = g.height ?? 100;
+  const gap = g.gap ?? 10;
+  const x0 = g.x ?? 0;
+  const y0 = g.y ?? 0;
+  return refs.map((r, i) => ({ object: r.ref, x: x0 + (i % g.columns) * (w + gap), y: y0 - Math.floor(i / g.columns) * (h + gap), width: w, height: h }));
+}
+
+export async function storeLayout(ctx: ToolContext, a: StoreLayoutArgs): Promise<OperationResult> {
+  const op = "store_layout";
+  const errors: string[] = [];
+  if (!Number.isInteger(a.layout) || a.layout < 1 || a.layout > 9999) errors.push("layout must be an integer from 1 to 9999");
+  if (a.name !== undefined && (a.name === "" || a.name.length > 128 || /["\u0000-\u001f]/.test(a.name))) errors.push("name must be 1 to 128 characters without quotes or control characters");
+  if (a.overwrite && a.append) errors.push("overwrite (rebuild the layout) and append (add to it) exclude each other");
+  if (!a.elements?.length && !a.grid) errors.push("give elements and/or grid: a layout is built from at least one element");
+  const planned: PlannedElement[] = [];
+  (a.elements ?? []).forEach((e, i) => {
+    checkElement(e, `elements[${i}]`, errors);
+    try {
+      planned.push({ source: "elements", args: e, ref: parseObject(e.object).ref });
+    } catch (err) {
+      errors.push(`elements[${i}].object: ${(err as Error).message}`);
+    }
   });
-  return { ...display, items };
-}
-async function allElements(bridge: Gma3Bridge, layout: number, t: number): Promise<Summary[]> {
-  const items: Summary[] = [];
-  let total: number | undefined;
-  for (;;) {
-    const page = await elementPage(bridge, layout, 500, items.length, t);
-    if (page.total > MAX_ELEMENTS) throw new Error(`Layout ${layout} has more than ${MAX_ELEMENTS} elements; this authoring tool refuses an incomplete identity check`);
-    if (total !== undefined && total !== page.total) throw new Error(`Layout ${layout} membership changed between pages; inspect again`);
-    total = page.total;
-    items.push(...page.items);
-    if (items.length > total) throw new Error(`Layout ${layout} returned more elements than its reported total`);
-    if (items.length >= page.total) return items;
-    if (!page.items.length) throw new Error(`Layout ${layout} element enumeration stopped before all ${page.total} elements were read`);
+  let gridRefs: ObjectRef[] = [];
+  if (a.grid) {
+    const g = a.grid;
+    if (!Number.isInteger(g.columns) || g.columns < 1 || g.columns > 100) errors.push("grid.columns must be a whole number from 1 to 100");
+    checkElement({ object: "", x: g.x, y: g.y, width: g.width, height: g.height }, "grid", errors);
+    if (g.gap !== undefined && (!Number.isInteger(g.gap) || g.gap < 0 || g.gap > 1000)) errors.push("grid.gap must be a whole number from 0 to 1000");
+    try {
+      gridRefs = expandRange(g.objects);
+    } catch (err) {
+      errors.push((err as Error).message);
+    }
+    // The positions the grid generates obey the same bounds as explicit elements (#159 review). The full range is
+    // checked: skip_missing only closes the grid up, so its positions are a subset of these.
+    if (!errors.length && gridRefs.length) {
+      const before = errors.length;
+      gridElements(g, gridRefs).forEach((e, i) => {
+        if (errors.length - before < 3) checkElement(e, `grid element ${i + 1} (${e.object})`, errors);
+      });
+    }
   }
-}
-function elementState(item: Summary) {
-  const no = Number(field(item, "No") ?? item.index);
-  return { element: Number.isInteger(no) && no > 0 ? no : null, guid: stringValue(field(item, "GUID")) ?? null, ref: item.addr ?? null, name: item.name ?? null, class: item.class ?? null, fields: upperFields(item.fields) };
-}
-function writable(item: Summary, ref: string): void {
-  for (const name of ["Lock", "StructureLocked", "SystemLocked"]) {
-    const state = lockState(field(item, name));
-    if (state !== false) throw new Error(`${ref} ${name} is ${state === true ? "enabled" : "unreadable"}; no edit was sent`);
-  }
-}
-function writableProperties(object: ObjectRead, ref: string, properties: string[]): void {
-  for (const property of properties) {
-    const found = object.schema?.find((p) => p.name.toUpperCase() === property.toUpperCase());
-    if (!found || found.readOnly !== false) throw new Error(`${ref}.${property} is ${found?.readOnly === true ? "read-only" : "not confirmed writable by the live schema"}`);
-  }
-}
+  if ((a.elements?.length ?? 0) + gridRefs.length > MAX_ELEMENTS) errors.push(`at most ${MAX_ELEMENTS} elements per call`);
+  const target: Record<string, unknown> = { layout: a.layout, ...(a.name !== undefined ? { name: a.name } : {}) };
+  if (errors.length) return validationFailure(op, target, errors);
 
-const readShape = { data_pool: numberSchema, layout: numberSchema.optional(), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(500).default(100), schema: z.boolean().default(false) };
-const readSchema = z.object(readShape).strict();
-export async function readLayouts(ctx: ToolContext, raw: unknown): Promise<unknown> {
-  const args = readSchema.parse(raw);
-  const scoped = inDataPool(ctx, args);
-  const { bridge, requestTimeoutMs: t } = scoped;
-  if (args.layout === undefined) return { data_pool: args.data_pool, ...(await listing(bridge, "DataPool.Layouts", LAYOUT_FIELDS, args.limit, args.offset, t)) };
-  const ref = layoutRef(args.layout);
-  const layout = await one(bridge, ref, LAYOUT_FIELDS, t);
-  if (!layout) return { data_pool: args.data_pool, layout: args.layout, exists: false };
-  const elements = await elementPage(bridge, args.layout, args.limit, args.offset, t);
-  const metadata = args.schema ? await schemaRead(bridge, ref, t) : undefined;
-  return { data_pool: args.data_pool, layout: args.layout, exists: true, ref: layout.addr, name: layout.name, fields: upperFields(layout.fields), total: elements.total, offset: args.offset, count: elements.items.length, incomplete: args.offset + elements.items.length < elements.total, elements: elements.items.map(elementState), ...(metadata ? { schema: metadata.schema } : {}) };
-}
-
-interface Write { property: string; value: string; expected: unknown; literal?: boolean }
-async function readAction(name: string, op: string, run: () => Promise<unknown>): Promise<StepResult> {
-  try { return asRead({ name, op, status: "succeeded", detail: await run() }); }
-  catch (err) { return asRead(stepFromError(name, err, { op })); }
-}
-function writeStep(ctx: ToolContext, name: string, ref: string, write: Write): Promise<StepResult> {
-  return requestStep(ctx.bridge, name, "set", { ref, property: write.property, value: write.value }, (raw) => {
-    const parsed = setReplySchema.safeParse(raw);
-    if (!parsed.success || parsed.data.readOk !== true) return { name, op: "set", status: "unknown", error: `The write was dispatched but ${ref}.${write.property} could not be read back; inspect before retrying`, detail: raw };
-    const actual = parsed.data.exact ?? parsed.data.value;
-    if (!(write.literal ? write.expected === actual : valuesEqual(write.expected, actual))) return { name, op: "set", status: "failed", error: `${ref}.${write.property} did not match the requested value`, detail: { expected: write.expected, actual } };
-    return { name, op: "set", status: "succeeded", detail: { property: write.property, value: actual } };
-  }, ctx.requestTimeoutMs);
-}
-function skip(names: string[], reason: string): StepResult[] { return names.map((name) => ({ name, status: "skipped", error: reason })); }
-function verifyWrites(checked: string, writes: Write[], actual: Record<string, unknown>): Verification {
-  const mismatches: string[] = [];
-  for (const write of writes) {
-    const got = actual[write.property.toUpperCase()];
-    if (!(write.literal ? write.expected === got : valuesEqual(write.expected, got))) mismatches.push(`${write.property}: expected ${JSON.stringify(write.expected)}, read ${JSON.stringify(got)}`);
-  }
-  return { status: mismatches.length ? "mismatched" : "matched", checked, ...(mismatches.length ? { detail: mismatches.join("; ") } : {}) };
-}
-
-function writesFrom(values: Record<string, unknown>, mappings: Record<string, string>): Write[] {
-  const out: Write[] = [];
-  for (const [key, property] of Object.entries(mappings)) {
-    const value = values[key];
-    if (value === undefined) continue;
-    // ViewPosScale accepts a ratio but its edit/read roles display percent (0.8 -> 80).
-    const expected = property === "ViewPosScale" && typeof value === "number" ? value * 100 : value;
-    out.push({ property, value: typeof value === "boolean" ? value ? "Yes" : "No" : String(value), expected, literal: ["Name", "Note", "CustomTextText"].includes(property) });
-  }
-  return out;
-}
-const layoutShape = {
-  data_pool: numberSchema, layout: numberSchema, mode: z.enum(["create", "update"]), name: z.string().optional(), note: z.string().max(2048).optional(),
-  canvas_x: coordinateSchema.optional(), canvas_y: coordinateSchema.optional(), canvas_width: dimensionSchema.optional(), canvas_height: dimensionSchema.optional(),
-  view_position_active: z.boolean().optional(), view_x: z.number().int().min(-2147483648).max(2147483647).optional(), view_y: z.number().int().min(-2147483648).max(2147483647).optional(), view_scale: z.number().positive().max(10000).optional(),
-  markers: z.boolean().optional(), value_colors: z.boolean().optional(), preview: z.boolean().default(false),
-};
-const storeSchema = z.object(layoutShape).strict();
-const LAYOUT_MAPPING = { name: "Name", note: "Note", canvas_x: "PositionX", canvas_y: "PositionY", canvas_width: "DimensionW", canvas_height: "DimensionH", view_position_active: "ViewPosActive", view_x: "ViewPosX", view_y: "ViewPosY", view_scale: "ViewPosScale", markers: "Markers", value_colors: "ValueColors" };
-
-export async function storeLayout(ctx: ToolContext, raw: unknown): Promise<OperationResult> {
-  const parsed = storeSchema.safeParse(raw);
-  if (!parsed.success) return validationFailure("store_layout", {}, parsed.error.issues.map((issue) => issue.message));
-  const args = parsed.data;
-  const target = { data_pool: args.data_pool, layout: args.layout, mode: args.mode };
-  const v = new Validator();
-  const name = args.name === undefined ? undefined : v.check(() => objectName("name", args.name));
-  const note = args.note === undefined ? undefined : v.check(() => noteText("note", args.note, { maxLength: 2048 }));
-  if (!v.ok) return validationFailure("store_layout", target, v.errors);
-  const writes = writesFrom({ ...args, name, note }, LAYOUT_MAPPING);
-  if (args.mode === "update" && !writes.length) return validationFailure("store_layout", target, ["update requires at least one supplied setting"]);
-  const scoped = inDataPool(ctx, args);
-  const ref = layoutRef(args.layout);
-  const planned = [...(args.mode === "create" ? [{ op: "cmd", command: scoped.bridge.sentCommand?.(`Store ${ref} /NoConfirmation`) ?? `Store ${ref} /NoConfirmation` }] : []), ...writes.map((write) => ({ op: "set", ref: `DataPool ${args.data_pool} ${ref}`, property: write.property, value: write.value }))];
-  const body = async () => {
+  return ctx.mutations.run(async () => {
+    const t = ctx.requestTimeoutMs;
     const steps: StepResult[] = [];
-    let before: Summary | null = null;
-    steps.push(await readAction("inspect_layout", "objects", async () => {
-      before = await one(scoped.bridge, ref, LAYOUT_FIELDS, scoped.requestTimeoutMs);
-      if (args.mode === "create" && before) throw new Error(`${ref} already exists; create refuses overwrite`);
-      if (args.mode === "update" && !before) throw new Error(`${ref} does not exist; update never creates it`);
-      if (before) writable(before, ref);
-      return before;
-    }));
-    if (steps[0]?.status === "succeeded" && name !== undefined) {
-      steps.push(await readAction("check_name", "children", async () => {
-        const result = await checkPoolName({ bridge: scoped.bridge, t: scoped.requestTimeoutMs, pool: { ref: "DataPool.Layouts", noun: "layout", plural: "layouts", label: layoutRef }, cache: new Map(), number: args.layout, name, onNameTaken: "refuse", warnings: [], keepOwn: true });
-        if (result.status !== "succeeded") throw new Error(result.error ?? "Layout name collision check failed");
-        return result.detail;
-      }));
-    }
-    if (steps.every((step) => step.status === "succeeded") && args.mode === "update") steps.push(await readAction("inspect_schema", "object", async () => {
-      const object = await schemaRead(scoped.bridge, ref, scoped.requestTimeoutMs);
-      writableProperties(object, ref, writes.map((write) => write.property));
-      return object.schema;
-    }));
-    if (steps.some((step) => step.status !== "succeeded")) return buildResult({ operation: "store_layout", target, steps, verification: unavailable("preflight refused before any mutation"), extra: { preview: args.preview, planned } });
-    if (args.preview) return buildResult({ operation: "store_layout", target, steps, verification: notRequested(), summary: `Preview only: ${ref} would be ${args.mode === "create" ? "created" : "updated"}; no mutation was sent.`, extra: { preview: true, planned, before } });
-    const plan = [];
-    if (args.mode === "create") {
-      plan.push({ name: "create_layout", run: () => commandStep(scoped.bridge, "create_layout", `Store ${ref} /NoConfirmation`, scoped.requestTimeoutMs) });
-      plan.push({ name: "inspect_created_schema", run: () => readAction("inspect_created_schema", "object", async () => {
-        const object = await schemaRead(scoped.bridge, ref, scoped.requestTimeoutMs);
-        if (object.class !== "Layout") throw new Error(`${ref} was not created as a Layout`);
-        writableProperties(object, ref, writes.map((write) => write.property));
-        return object.schema;
-      }) });
-    }
-    for (const write of writes) plan.push({ name: `set_${write.property}`, run: () => writeStep(scoped, `set_${write.property}`, ref, write) });
-    const mutation = await runSteps(plan);
-    steps.push(...mutation.steps);
-    const after: { resulting: Summary | null } = { resulting: null };
-    const readBack = await readAction("read_back", "objects", async () => {
-      const resulting = await one(scoped.bridge, ref, LAYOUT_FIELDS, scoped.requestTimeoutMs);
-      if (!resulting || resulting.class !== "Layout") throw new Error(`${ref} could not be read back as a Layout`);
-      after.resulting = resulting;
-      return resulting;
-    });
-    steps.push(readBack);
-    const resulting = after.resulting;
-    const verification = readBack.status === "succeeded" && resulting ? verifyWrites("Layout existence and supplied fields", writes, upperFields(resulting.fields)) : unavailable("Layout read-back failed");
-    return buildResult({ operation: "store_layout", target, steps, verification, warnings: ["Serialisation covers this MCP server only; another operator or client can change the layout between inspection and a write."], extra: { preview: false, planned, before, resulting } });
-  };
-  return args.preview ? body() : ctx.mutations.run(body);
-}
+    const warnings: string[] = [];
+    const stop = (step: StepResult, why = "nothing was sent") => {
+      steps.push(step);
+      return buildResult({ operation: op, target, steps, verification: unavailable(why), warnings });
+    };
 
-// Values captured from the live 2.5.1.1 enum collections; actions are narrowed by the assigned class.
-const objectTargetSchema = z.object({ type: z.enum(["Macro", "Sequence", "Group"]), number: numberSchema }).strict();
-const visibilityValue = z.enum(["Visible", "Hidden"]);
-const visibilitySchema = z.object({ element: visibilityValue.optional(), object_name: visibilityValue.optional(), id: visibilityValue.optional(), cid: visibilityValue.optional(), bar: visibilityValue.optional(), value: visibilityValue.optional(), icon: visibilityValue.optional(), indicator_bar: visibilityValue.optional(), border: visibilityValue.optional() }).strict();
-const changeShape = {
-  object: objectTargetSchema.optional(), replace_object: z.boolean().default(false),
-  x: coordinateSchema.optional(), y: coordinateSchema.optional(), width: dimensionSchema.optional(), height: dimensionSchema.optional(),
-  action: z.string().min(1).max(40).optional(), appearance: numberSchema.optional(),
-  custom_text: z.string().max(2048).regex(/^[^\x00-\x1f\x7f]*$/, "custom_text must contain no control characters or line breaks").refine((value) => value.trim() === value, "custom_text leading/trailing whitespace cannot be independently verified; use padding fields in a later feature").optional(),
-  custom_text_color: z.string().regex(/^[0-9a-fA-F]{8}$/, "colour must be eight hexadecimal RGBA digits, e.g. 11AA33FF").transform((value) => value.toUpperCase()).optional(),
-  custom_text_size: z.enum(["9", "11", "14", "16", "18", "20", "24", "28", "32"]).optional(),
-  custom_text_align_h: z.enum(["Center", "Left", "Right", "OutsideLeft", "OutsideRight"]).optional(),
-  custom_text_align_v: z.enum(["Center", "Top", "Bottom", "Above", "Below"]).optional(),
-  custom_text_vertical: z.boolean().optional(), visibility: visibilitySchema.optional(),
-};
-const identitySchema = z.object({ element: numberSchema, guid: z.string().min(1).max(200) }).strict();
-const addSchema = z.object({ ...changeShape, operation: z.literal("add"), x: coordinateSchema, y: coordinateSchema, width: dimensionSchema, height: dimensionSchema }).strict();
-const updateSchema = z.object({ ...changeShape, operation: z.literal("update"), identity: identitySchema }).strict();
-const removeSchema = z.object({ operation: z.literal("remove"), identity: identitySchema }).strict();
-const editShape = { data_pool: numberSchema, layout: numberSchema, edits: z.array(z.discriminatedUnion("operation", [addSchema, updateSchema, removeSchema])).min(1).max(MAX_EDITS), preview: z.boolean().default(false) };
-const editSchema = z.object(editShape).strict();
-type Edit = z.infer<typeof editSchema>["edits"][number];
-type Change = z.infer<typeof updateSchema> | z.infer<typeof addSchema>;
-const ELEMENT_MAPPING = { x: "PosX", y: "PosY", width: "Width", height: "Height", action: "Action", custom_text: "CustomTextText", custom_text_color: "CustomTextColor", custom_text_size: "CustomTextSize", custom_text_align_h: "CustomTextAlignmentH", custom_text_align_v: "CustomTextAlignmentV", custom_text_vertical: "CustomTextVertical" };
-const VISIBILITY_MAPPING = { element: "VisibilityElement", object_name: "VisibilityObjectName", id: "VisibilityID", cid: "VisibilityCID", bar: "VisibilityBar", value: "VisibilityValue", icon: "VisibilityIcon", indicator_bar: "VisibilityIndicatorBar", border: "VisibilityBorder" };
-const ACTIONS: Record<string, Set<string>> = {
-  Macro: new Set(["<<<", ">>>", "Call", "Go+", "Go-", "Off", "Pause"]),
-  Group: new Set(["SelectFixtures"]),
-  Sequence: new Set(["Go+", "Go-", "<<<", ">>>", "On", "Off", "Toggle", "Top", "Kill", "Pause", "Goto", "Load", "Select", "SelectFixtures", "Rate1", "Speed1", "Learn", "LearnSpeed", "HalfSpeed", "DoubleSpeed", "ReSync", "FastSync", "Flash", "Temp", "Swap", "Black", "Time"]),
-};
-function changes(edit: Change): Write[] {
-  return [...writesFrom(edit, ELEMENT_MAPPING), ...writesFrom(edit.visibility ?? {}, VISIBILITY_MAPPING)];
-}
-function assigned(item: Summary): Summary | null {
-  const value = field(item, "Object");
-  if (value === undefined || value === null || value === "") return null;
-  const result = summarySchema.safeParse(value);
-  if (!result.success) throw new Error("Assigned object is not a typed handle; emptiness cannot be established");
-  if (result.data.invalid) return null;
-  if (!result.data.addr || !result.data.class) throw new Error("Assigned object has no readable class/address; inspect again before editing");
-  return result.data;
-}
-function assignmentMatches(item: Summary, address: string): boolean {
-  try { return assigned(item)?.addr === address; }
-  catch { return false; }
-}
-function identityItem(items: Summary[], identity: z.infer<typeof identitySchema>): Summary {
-  const item = items.find((candidate) => elementState(candidate).element === identity.element);
-  if (!item || elementState(item).guid !== identity.guid) throw new Error(`Element ${identity.element} no longer has GUID ${identity.guid}; read the layout again before editing`);
-  return item;
-}
-interface PreparedEdit { edit: Edit; object?: Summary; appearance?: Summary; writes: Write[] }
-
-export async function editLayoutElements(ctx: ToolContext, raw: unknown): Promise<OperationResult> {
-  const parsed = editSchema.safeParse(raw);
-  if (!parsed.success) return validationFailure("edit_layout_elements", {}, parsed.error.issues.map((issue) => issue.message));
-  const args = parsed.data;
-  const scoped = inDataPool(ctx, args);
-  const target = { data_pool: args.data_pool, layout: args.layout };
-  const ref = layoutRef(args.layout);
-  const body = async () => {
-    const steps: StepResult[] = [];
-    const prepared: PreparedEdit[] = [];
-    const snapshot: { items: Summary[] } = { items: [] };
-    steps.push(await readAction("inspect_layout", "objects", async () => {
-      const item = await one(scoped.bridge, ref, LAYOUT_FIELDS, scoped.requestTimeoutMs);
-      if (!item || item.class !== "Layout") throw new Error(`${ref} does not exist as a Layout`);
-      writable(item, ref);
-      return item;
-    }));
-    if (steps[0]?.status === "succeeded") steps.push(await readAction("inspect_elements", "children", async () => {
-      snapshot.items = await allElements(scoped.bridge, args.layout, scoped.requestTimeoutMs);
-      if (snapshot.items.some((item) => item.class !== "Element")) throw new Error("Layout has an unexpected child class; edit refused");
-      const identities = snapshot.items.map((item) => elementState(item).guid);
-      if (identities.some((guid) => !guid) || new Set(identities).size !== identities.length) throw new Error("Every existing element must have a readable, unique GUID before editing");
-      const numbers = snapshot.items.map((item) => elementState(item).element);
-      if (numbers.some((number) => number === null) || new Set(numbers).size !== numbers.length) throw new Error("Every existing element must have a readable, unique number before editing");
-      return snapshot.items.map(elementState);
-    }));
-    const used = new Set<string>();
-    for (const [index, edit] of args.edits.entries()) {
-      const name = `check_edit_${index + 1}`;
-      if (steps.some((step) => step.status !== "succeeded")) { steps.push(...skip([name], "earlier preflight failed")); continue; }
-      steps.push(await readAction(name, "objects", async () => {
-        let item: Summary | undefined;
-        if (edit.operation !== "add") {
-          if (used.has(edit.identity.guid)) throw new Error(`GUID ${edit.identity.guid} is targeted more than once in edits`);
-          used.add(edit.identity.guid);
-          item = identityItem(snapshot.items, edit.identity);
-          writable(item, elementRef(args.layout, edit.identity.element));
-        }
-        const writes = edit.operation === "remove" ? [] : changes(edit);
-        const preparedEdit: PreparedEdit = { edit, writes };
-        if (edit.operation !== "remove" && edit.object) {
-          const objectRef = `${edit.object.type} ${edit.object.number}`;
-          const object = await one(scoped.bridge, objectRef, ["Name"], scoped.requestTimeoutMs, false);
-          if (!object || object.class !== edit.object.type || !object.addr || !/^\d+(?:\.\d+)*$/.test(object.addr)) throw new Error(`${objectRef} has no readable matching object handle`);
-          const previous = item ? assigned(item) : null;
-          if (previous && previous.addr !== object.addr && !edit.replace_object) throw new Error(`Element ${edit.operation === "update" ? edit.identity.element : "new"} already holds ${previous.class} ${previous.name}; replace_object: true is required`);
-          preparedEdit.object = object;
-        }
-        if (edit.operation !== "remove" && edit.appearance !== undefined) {
-          const appearance = await one(scoped.bridge, `Appearance ${edit.appearance}`, ["Name"], scoped.requestTimeoutMs, false);
-          if (!appearance || appearance.class !== "Appearance" || !appearance.addr || !/^\d+(?:\.\d+)*$/.test(appearance.addr)) throw new Error(`Appearance ${edit.appearance} has no readable matching handle`);
-          preparedEdit.appearance = appearance;
-        }
-        if (edit.operation !== "remove" && edit.action !== undefined) {
-          const object = preparedEdit.object ?? (item ? assigned(item) : null);
-          const allowed = object?.class ? ACTIONS[object.class] : undefined;
-          if (!allowed?.has(edit.action)) throw new Error(`Action ${edit.action} is not supported for ${object?.class ?? "an unassigned element"}; supported: ${allowed ? [...allowed].join(", ") : "none"}`);
-        }
-        if (edit.operation === "update" && !writes.length && !preparedEdit.object && !preparedEdit.appearance) throw new Error("update requires at least one changed setting or object assignment");
-        if (item && edit.operation !== "add") {
-          const schema = await schemaRead(scoped.bridge, elementRef(args.layout, edit.identity.element), scoped.requestTimeoutMs);
-          writableProperties(schema, ref, [...writes.map((write) => write.property), ...(preparedEdit.object ? ["Object"] : []), ...(preparedEdit.appearance ? ["Appearance"] : [])]);
-        }
-        prepared.push(preparedEdit);
-        return { operation: edit.operation, ...(edit.operation === "add" ? {} : { identity: edit.identity }), writes, object: preparedEdit.object, appearance: preparedEdit.appearance };
-      }));
+    // The layout slot.
+    let existing: { name?: string } | null = null;
+    try {
+      const r = await readObjects(ctx.bridge, `Layout ${a.layout}`, ["Name"], 1);
+      const item = r?.items?.[0];
+      existing = item && !item.invalid ? { name: String(item.fields?.Name ?? item.name ?? "") } : null;
+    } catch (err) {
+      return stop(asRead(stepFromError("check_layout", err, { op: "objects" })));
     }
-    const planned = prepared.map((item) => ({ operation: item.edit.operation, ...(item.edit.operation === "add" ? { new_element: "append" } : { identity: item.edit.identity }), ...(item.object ? { object_address: item.object.addr } : {}), writes: item.writes, ...(item.appearance ? { appearance_address: item.appearance.addr } : {}) }));
-    if (steps.some((step) => step.status !== "succeeded")) return buildResult({ operation: "edit_layout_elements", target, steps, verification: unavailable("preflight failed; no mutation was sent"), extra: { preview: args.preview, planned } });
-    if (args.preview) return buildResult({ operation: "edit_layout_elements", target, steps, summary: `Preview only: ${prepared.length} element edit(s) validated; no mutation was sent. New element schemas are checked after creation.`, extra: { preview: true, planned, before: snapshot.items.map(elementState) } });
-    return executeElementEdits(scoped, args.layout, target, prepared, snapshot.items, steps, planned);
-  };
-  return args.preview ? body() : ctx.mutations.run(body);
-}
+    if (existing && !a.overwrite && !a.append) return stop(asRead({ name: "check_layout", status: "failed", op: "objects", error: `Layout ${a.layout} exists (${JSON.stringify(existing.name)}); pass overwrite: true to rebuild it or append: true to add elements to it, or choose a free number` }));
+    steps.push(asRead({ name: "check_layout", status: "succeeded", op: "objects", detail: { exists: Boolean(existing), ...(existing ? { name: existing.name } : {}) } }));
 
-async function executeElementEdits(ctx: ToolContext, layout: number, target: Record<string, unknown>, prepared: PreparedEdit[], before: Summary[], steps: StepResult[], planned: unknown[]): Promise<OperationResult> {
-  const state: { current: Summary[]; item?: Summary; guid?: string } = { current: before };
-  const expectations: Array<{ operation: string; guid: string; writes: Write[]; object?: string; appearance?: string }> = [];
-  let stopped = false;
-  for (const [index, item] of prepared.entries()) {
-    const prefix = `edit_${index + 1}`;
-    if (stopped) { steps.push(...skip([prefix], "an earlier mutation failed or is uncertain")); continue; }
-    const edit = item.edit;
-    const refresh = await readAction(`${prefix}_recheck`, "children", async () => {
-      const owner = await one(ctx.bridge, layoutRef(layout), LAYOUT_FIELDS, ctx.requestTimeoutMs);
-      if (!owner) throw new Error("Layout disappeared before mutation");
-      writable(owner, layoutRef(layout));
-      const current = await allElements(ctx.bridge, layout, ctx.requestTimeoutMs);
-      const expected = state.current.map((entry) => elementState(entry).guid).sort();
-      const actual = current.map((entry) => elementState(entry).guid).sort();
-      if (JSON.stringify(expected) !== JSON.stringify(actual)) throw new Error("Layout membership changed since preflight; read it again before editing");
-      state.current = current;
-      if (edit.operation !== "add") {
-        const existing = current.find((entry) => elementState(entry).guid === edit.identity.guid);
-        if (!existing) throw new Error("Target GUID disappeared before mutation");
-        const number = elementState(existing).element;
-        if (number === null) throw new Error("Target element has no readable number");
-        writable(existing, elementRef(layout, number));
-        const old = before.find((entry) => elementState(entry).guid === edit.identity.guid);
-        if (!old || assigned(old)?.addr !== assigned(existing)?.addr) throw new Error("Element assignment changed since preflight; read it again before editing");
-        state.item = existing;
-        state.guid = edit.identity.guid;
+    // The name.
+    if (a.name !== undefined) {
+      const cache: PoolNameCache<string> = new Map();
+      const chk = await checkPoolName({ bridge: ctx.bridge, t, pool: LAYOUT_POOL, cache, number: a.layout, name: a.name, onNameTaken: a.on_name_taken ?? "refuse", warnings, keepOwn: true });
+      steps.push(asRead({ name: "check_name", status: chk.status, op: "children", detail: chk.detail, ...(chk.error ? { error: chk.error } : {}) }));
+      if (chk.status !== "succeeded") return buildResult({ operation: op, target, steps, verification: unavailable("nothing was sent"), warnings });
+    }
+
+    // Every object: one read each, in order.
+    const missing: string[] = [];
+    for (const r of gridRefs) planned.push({ source: "grid", args: { object: r.ref }, ref: r.ref });
+    for (const p of planned) {
+      try {
+        const r = await readObjects(ctx.bridge, p.ref, ["Name"], 1);
+        const item = r?.items?.[0];
+        if (!item || item.invalid) missing.push(p.ref);
+        else p.target = { class: item.class, name: item.name, addr: item.addr };
+      } catch (err) {
+        return stop(asRead(stepFromError("check_objects", err, { op: "objects" })));
       }
-      return current.map(elementState);
-    });
-    steps.push(refresh);
-    if (refresh.status !== "succeeded") { stopped = true; continue; }
-    if (edit.operation === "add") {
-      const next = Math.max(0, ...state.current.map((entry) => elementState(entry).element ?? 0)) + 1;
-      if (next > 9999) { steps.push({ name: `${prefix}_create`, status: "failed", kind: "read", error: "Next element number exceeds the supported 9999 bound" }); stopped = true; continue; }
-      const create = await commandStep(ctx.bridge, `${prefix}_create`, `Store ${elementRef(layout, next)} /NoConfirmation`, ctx.requestTimeoutMs);
-      steps.push(create);
-      if (create.status !== "succeeded") { stopped = true; continue; }
-      const inspect = await readAction(`${prefix}_identify_created`, "children", async () => {
-        const after = await allElements(ctx.bridge, layout, ctx.requestTimeoutMs);
-        const previous = new Set(state.current.map((entry) => elementState(entry).guid));
-        const added = after.filter((entry) => !previous.has(elementState(entry).guid));
-        if (after.length !== state.current.length + 1 || added.length !== 1 || state.current.some((entry) => !after.some((candidate) => elementState(candidate).guid === elementState(entry).guid))) throw new Error("Creation did not add exactly one new GUID while preserving every prior element; inspect before continuing");
-        const created = added[0];
-        if (!created || !elementState(created).guid || elementState(created).element !== next) throw new Error("Created element has no unambiguous GUID/number");
-        writable(created, elementRef(layout, next));
-        state.item = created;
-        state.guid = elementState(created).guid ?? undefined;
-        state.current = after;
-        return elementState(created);
+    }
+    const missingExplicit = planned.filter((p) => p.source === "elements" && !p.target).map((p) => p.ref);
+    const missingGrid = planned.filter((p) => p.source === "grid" && !p.target).map((p) => p.ref);
+    if (missingExplicit.length || (missingGrid.length && !a.grid?.skip_missing)) {
+      return stop(asRead({ name: "check_objects", status: "failed", op: "objects", error: `${[...missingExplicit, ...missingGrid].join(", ")} ${missingExplicit.length + missingGrid.length === 1 ? "does" : "do"} not exist${missingGrid.length ? "; pass grid.skip_missing: true to leave a range's empty numbers out" : ""}; nothing was sent`, detail: { missing: [...missingExplicit, ...missingGrid] } }));
+    }
+    const build = planned.filter((p) => p.target);
+    // The grid is laid out over the objects that exist: a skipped number leaves no hole.
+    if (a.grid) {
+      const cells = build.filter((p) => p.source === "grid");
+      const layoutOf = gridElements(a.grid, cells.map((p) => ({ keyword: "", ref: p.ref })));
+      cells.forEach((p, i) => (p.args = layoutOf[i]));
+    }
+    if (missingGrid.length) warnings.push(`grid.objects: ${missingGrid.join(", ")} do not exist and were left out (skip_missing)`);
+    if (!build.length) return stop(asRead({ name: "check_objects", status: "failed", op: "objects", error: "no object of the grid exists; nothing was sent" }));
+    const unaddressed = build.filter((p) => !p.target?.addr).map((p) => p.ref);
+    if (unaddressed.length) return stop(asRead({ name: "check_objects", status: "failed", op: "objects", error: `${unaddressed.join(", ")} read without an address, so the element could not be checked after the Assign; nothing was sent` }));
+    steps.push(asRead({ name: "check_objects", status: "succeeded", op: "objects", detail: { objects: build.length, ...(missingGrid.length ? { skipped: missingGrid } : {}) } }));
+
+    // Elements already there (append).
+    let before = 0;
+    if (existing && a.append) {
+      try {
+        const r = (await ctx.bridge.request("children", { ref: `Layout ${a.layout}`, limit: 1, offset: 0 }, t)) as ChildList;
+        if (r?.enumerationError !== undefined && r.enumerationError !== null) return stop(asRead({ name: "check_elements", status: "failed", op: "children", error: `the elements of Layout ${a.layout} could not be listed: ${String(r.enumerationError)}; nothing was sent` }));
+        before = Number(r?.total ?? 0);
+      } catch (err) {
+        return stop(asRead(stepFromError("check_elements", err, { op: "children" })));
+      }
+      steps.push(asRead({ name: "check_elements", status: "succeeded", op: "children", detail: { elements: before } }));
+    }
+
+    const plan = build.map((p) => `Assign ${p.ref} At Layout ${a.layout}`);
+    if (a.preview) {
+      return buildResult({
+        operation: op,
+        target,
+        steps,
+        verification: { status: "not_requested" },
+        warnings,
+        summary: `Preview: ${existing && a.overwrite ? `Delete Layout ${a.layout}, then ` : ""}${plan.length} element${plan.length === 1 ? "" : "s"} for Layout ${a.layout}; nothing was sent.`,
+        extra: { preview: true, commands: [...(existing && a.overwrite ? [`Delete Layout ${a.layout} /NoConfirmation`] : []), ...plan], elements: build.map((p) => ({ ...p.args, object: p.ref })) },
       });
-      steps.push(inspect);
-      if (inspect.status !== "succeeded") { stopped = true; continue; }
     }
-    const selected = state.item;
-    const guid = state.guid;
-    const number = selected ? elementState(selected).element : null;
-    if (!selected || !guid || number === null) { steps.push({ name: prefix, status: "failed", kind: "read", error: "No confirmed element identity; mutation refused" }); stopped = true; continue; }
-    const ref = elementRef(layout, number);
-    expectations.push({ operation: edit.operation, guid, writes: item.writes, object: item.object?.addr, appearance: item.appearance?.addr });
-    if (edit.operation === "remove") {
-      const remove = await commandStep(ctx.bridge, `${prefix}_remove`, `Delete ${ref} /NoConfirmation`, ctx.requestTimeoutMs);
-      steps.push(remove);
-      if (remove.status !== "succeeded") { stopped = true; continue; }
-      const verifyRemove = await readAction(`${prefix}_verify_removed`, "children", async () => {
-        const after = await allElements(ctx.bridge, layout, ctx.requestTimeoutMs);
-        const remaining = state.current.filter((entry) => elementState(entry).guid !== guid).map((entry) => elementState(entry).guid).sort();
-        if (JSON.stringify(remaining) !== JSON.stringify(after.map((entry) => elementState(entry).guid).sort())) throw new Error("Delete did not remove exactly the requested GUID; inspect before continuing");
-        state.current = after;
-        return { removed: guid, remaining: after.map(elementState) };
-      });
-      steps.push(verifyRemove);
-      stopped = verifyRemove.status !== "succeeded";
-      continue;
+
+    // Rebuild: the old layout goes first and must be gone.
+    if (existing && a.overwrite) {
+      const del = await commandStep(ctx.bridge, "delete_old", `Delete Layout ${a.layout} /NoConfirmation`, t);
+      steps.push(del);
+      if (del.status !== "succeeded") return buildResult({ operation: op, target, steps, verification: unavailable("the old layout could not be deleted; no element was added"), warnings });
+      try {
+        const r = await readObjects(ctx.bridge, `Layout ${a.layout}`, ["Name"], 1);
+        const item = r?.items?.[0];
+        if (item && !item.invalid) return stop(asRead({ name: "check_deleted", status: "failed", op: "objects", error: `Layout ${a.layout} is still there after the Delete; no element was added` }), "the old layout was not deleted");
+      } catch (err) {
+        return stop(asRead(stepFromError("check_deleted", err, { op: "objects" })), "whether the old layout is gone is unknown; no element was added");
+      }
+      steps.push(asRead({ name: "check_deleted", status: "succeeded", op: "objects" }));
     }
-    const schemaStep = await readAction(`${prefix}_schema`, "object", async () => {
-      const schema = await schemaRead(ctx.bridge, ref, ctx.requestTimeoutMs);
-      writableProperties(schema, ref, [...item.writes.map((write) => write.property), ...(item.object ? ["Object"] : []), ...(item.appearance ? ["Appearance"] : [])]);
-      return schema.schema;
-    });
-    steps.push(schemaStep);
-    if (schemaStep.status !== "succeeded") { stopped = true; continue; }
-    const plan: Array<{ name: string; run: () => Promise<StepResult> }> = [];
-    const object = item.object;
-    if (object?.addr) {
-      plan.push({ name: `${prefix}_assign`, run: () => requestStep(ctx.bridge, `${prefix}_assign`, "set", { ref, property: "Object", value: object.addr }, (raw) => {
-        const result = setReplySchema.safeParse(raw);
-        return result.success && result.data.readOk === true ? { name: `${prefix}_assign`, op: "set", status: "succeeded", detail: result.data } : { name: `${prefix}_assign`, op: "set", status: "unknown", error: "Object assignment was dispatched but its immediate read failed; inspect before retrying", detail: raw };
-      }, ctx.requestTimeoutMs) });
-      plan.push({ name: `${prefix}_verify_assignment`, run: () => readAction(`${prefix}_verify_assignment`, "objects", async () => {
-        const actual = await one(ctx.bridge, ref, ["Object"], ctx.requestTimeoutMs, false);
-        if (!actual || assigned(actual)?.addr !== object.addr) throw new Error(`Object assignment does not match ${object.class} at ${object.addr}`);
-        return assigned(actual);
-      }) });
-    }
-    const appearance = item.appearance;
-    const appearanceState: { token?: string } = {};
-    if (appearance?.addr) {
-      plan.push({ name: `${prefix}_appearance`, run: () => requestStep(ctx.bridge, `${prefix}_appearance`, "set", { ref, property: "Appearance", value: appearance.addr }, (raw) => {
-        const result = setReplySchema.safeParse(raw);
-        if (!result.success || result.data.readOk !== true) return { name: `${prefix}_appearance`, op: "set", status: "unknown", error: "Appearance write could not be read back; inspect before retrying", detail: raw };
-        const token = result.data.value;
-        if (typeof token !== "string" || !/^#[0-9a-f]+$/i.test(token)) return { name: `${prefix}_appearance`, op: "set", status: "failed", error: "Appearance did not become a resolvable encoded handle", detail: raw };
-        appearanceState.token = token;
-        return { name: `${prefix}_appearance`, op: "set", status: "succeeded", detail: { token } };
-      }, ctx.requestTimeoutMs) });
-      plan.push({ name: `${prefix}_verify_appearance`, run: () => readAction(`${prefix}_verify_appearance`, "object", async () => {
-        if (!appearanceState.token) throw new Error("No appearance handle was returned");
-        const actual = objectSchema.parse(await ctx.bridge.request("object", { ref: appearanceState.token, properties: false }, ctx.requestTimeoutMs));
-        if (actual.class !== "Appearance" || actual.addr !== appearance.addr) throw new Error("Resolved appearance does not match the requested appearance address");
-        return actual;
-      }) });
-    }
-    for (const write of item.writes) plan.push({ name: `${prefix}_set_${write.property}`, run: () => writeStep(ctx, `${prefix}_set_${write.property}`, ref, write) });
-    const mutation = await runSteps(plan);
-    steps.push(...mutation.steps);
-    stopped = mutation.outcome !== "succeeded";
-  }
-  const after: { items?: Summary[] } = {};
-  const readBack = await readAction("read_back_elements", "children", async () => { after.items = await allElements(ctx.bridge, layout, ctx.requestTimeoutMs); return after.items.map(elementState); });
-  steps.push(readBack);
-  let verification: Verification = unavailable(after.items ? "No requested mutation had a confirmed element identity to verify" : "Element read-back failed");
-  if (after.items && expectations.length) {
-    const mismatches: string[] = [];
-    for (const expected of expectations) {
-      const actual = after.items.find((entry) => elementState(entry).guid === expected.guid);
-      if (expected.operation === "remove") { if (actual) mismatches.push(`GUID ${expected.guid} still exists`); continue; }
-      if (!actual) { mismatches.push(`GUID ${expected.guid} is missing`); continue; }
-      const compared = verifyWrites(`Element ${expected.guid} supplied fields`, expected.writes, upperFields(actual.fields));
-      if (compared.status !== "matched") mismatches.push(compared.detail ?? "Element fields could not be compared");
-      if (expected.object && !assignmentMatches(actual, expected.object)) mismatches.push(`GUID ${expected.guid} assignment does not match ${expected.object}`);
-      if (expected.appearance) {
-        const checkAppearance = await readAction(`read_back_appearance_${expected.guid}`, "object", async () => {
-          const token = field(actual, "Appearance");
-          if (typeof token !== "string" || !/^#[0-9a-f]+$/i.test(token)) throw new Error("Appearance token is unreadable");
-          const resolved = objectSchema.parse(await ctx.bridge.request("object", { ref: token, properties: false }, ctx.requestTimeoutMs));
-          if (resolved.class !== "Appearance" || resolved.addr !== expected.appearance) throw new Error("Appearance address does not match");
-          return resolved;
+
+    // One Assign per element; the new element must be the layout's last child, showing the object, before its
+    // properties are set. Anything else stops the call: the layout's state is no longer the planned one.
+    let count = before;
+    let stopped: string | undefined;
+    const placed: Array<{ p: PlannedElement; index: number }> = [];
+    for (let i = 0; i < build.length && !stopped; i++) {
+      const p = build[i];
+      const name = `element_${i + 1}`;
+      const assign = await commandStep(ctx.bridge, `${name}_assign`, plan[i], t);
+      if (assign.status !== "succeeded") {
+        steps.push(assign);
+        stopped = `the Assign of ${p.ref} did not succeed`;
+        break;
+      }
+      let last: ElementRead | undefined;
+      let total = 0;
+      try {
+        const r = await readElements(ctx, a.layout, count, t);
+        total = r.total;
+        if (!r.complete) throw new Error(r.error ?? "the new element could not be read");
+        last = r.elements[r.elements.length - 1];
+      } catch (err) {
+        steps.push(assign, asRead(stepFromError(`${name}_check`, err, { op: "children" })));
+        stopped = `the element for ${p.ref} could not be read after the Assign`;
+        break;
+      }
+      if (total !== count + 1 || !last || last.object?.addr !== p.target!.addr) {
+        steps.push(assign, asRead({ name: `${name}_check`, status: "failed", op: "children", error: `after Assign ${p.ref} Layout ${a.layout} has ${total} elements (expected ${count + 1}) and its last shows ${last?.object ? `${last.object.class ?? "?"} ${JSON.stringify(last.object.name ?? "")}` : "nothing"}, not ${p.ref}; the call stops here`, detail: { total, expected: count + 1, last } }));
+        stopped = `the Assign of ${p.ref} did not add exactly one element showing it`;
+        break;
+      }
+      count = total;
+      placed.push({ p, index: total });
+      // The Assign is its own (succeeded) step, so a property write that fails after it leaves a partial outcome,
+      // never a failed one that hides the element it added (#159 review).
+      steps.push({ ...assign, name: `${name}_assign`, detail: { object: p.ref, element: total } });
+      // Properties: one set each on the element's address; the set op reads each back.
+      const sets: Record<string, unknown> = {};
+      const setErrors: string[] = [];
+      for (const spec of PROPS) {
+        const v = p.args[spec.key];
+        if (v === undefined || spec.key === "object") continue;
+        try {
+          const res = (await ctx.bridge.request("set", { ref: last.addr, property: spec.prop, value: written(spec, v) }, t)) as { value?: unknown; readOk?: boolean };
+          sets[spec.prop] = res?.value ?? null;
+        } catch (err) {
+          const s = stepFromError("set", err);
+          setErrors.push(`${spec.prop}: ${s.error}`);
+          if (s.status === "unknown") stopped = `the console did not answer setting ${spec.prop} of ${p.ref}'s element`;
+        }
+        if (stopped) break;
+      }
+      if (Object.keys(sets).length || setErrors.length) {
+        steps.push({
+          name: `${name}_set`,
+          status: setErrors.length ? (stopped ? "unknown" : "failed") : "succeeded",
+          op: "set",
+          detail: { object: p.ref, element: total, ...(Object.keys(sets).length ? { set: sets } : {}) },
+          ...(setErrors.length ? { error: setErrors.join("; ") } : {}),
         });
-        steps.push(checkAppearance);
-        if (checkAppearance.status !== "succeeded") mismatches.push(`GUID ${expected.guid} appearance could not be verified`);
       }
     }
-    verification = { status: mismatches.length ? "mismatched" : "matched", checked: "Requested element GUIDs, supplied fields and assigned object addresses; retained elements are not rendered or invoked", ...(mismatches.length ? { detail: mismatches.join("; ") } : {}) };
-  }
-  return buildResult({ operation: "edit_layout_elements", target, steps, verification, warnings: ["Element numbers can shift after deletion. Use the returned GUID/current number identities for the next call. Serialisation covers this server only; other operators and clients are not isolated."], extra: { preview: false, planned, before: before.map(elementState), resulting: after.items?.map(elementState) ?? null } });
+
+    // The layout's name.
+    if (a.name !== undefined && !stopped) {
+      try {
+        const res = (await ctx.bridge.request("set", { ref: `Layout ${a.layout}`, property: "Name", value: a.name }, t)) as { value?: unknown };
+        steps.push({ name: "name", status: "succeeded", op: "set", detail: { read: res?.value ?? null } });
+      } catch (err) {
+        steps.push(stepFromError("name", err, { op: "set" }));
+      }
+    }
+
+    // Read back the whole layout and compare every placed element.
+    const checked = `Layout ${a.layout} has ${before + build.length} elements; each new one shows its object (by address) and every asked property${a.name !== undefined ? "; the layout carries the name" : ""}`;
+    let verification: Verification;
+    let readBack: ElementRead[] | undefined;
+    let layoutName: string | undefined;
+    try {
+      const r = await readElements(ctx, a.layout, 0, t);
+      if (!r.complete) throw new Error(r.error ?? "incomplete read");
+      readBack = r.elements;
+      const ln = await readObjects(ctx.bridge, `Layout ${a.layout}`, ["Name"], 1);
+      layoutName = ln?.items?.[0] ? String(ln.items[0].fields?.Name ?? ln.items[0].name ?? "") : undefined;
+      steps.push(asRead({ name: "read_back", status: "succeeded", op: "children", detail: { elements: r.total } }));
+    } catch (err) {
+      steps.push(asRead(stepFromError("read_back", err, { op: "children" })));
+    }
+    if (!readBack) verification = unavailable("the layout could not be read back", checked);
+    else {
+      const mismatches: string[] = [];
+      if (readBack.length !== before + placed.length) mismatches.push(`Layout ${a.layout} has ${readBack.length} elements, expected ${before + placed.length}`);
+      for (const { p, index } of placed) {
+        const el = readBack[index - 1];
+        if (!el) {
+          mismatches.push(`element ${index} (${p.ref}) is missing`);
+          continue;
+        }
+        if (el.object?.addr !== p.target!.addr) mismatches.push(`element ${index} shows ${el.object?.name ?? "nothing"}, not ${p.ref}`);
+        for (const spec of PROPS) {
+          const want = p.args[spec.key];
+          if (want === undefined || spec.key === "object") continue;
+          const got = el.props[spec.prop];
+          if (el.fieldErrors?.[spec.prop] !== undefined) mismatches.push(`element ${index} (${p.ref}) ${spec.prop} could not be read (${String(el.fieldErrors[spec.prop])})`);
+          else if (!propMatches(spec, want, got)) mismatches.push(`element ${index} (${p.ref}) ${spec.prop} reads ${JSON.stringify(got ?? null)}, asked ${JSON.stringify(written(spec, want))}`);
+        }
+      }
+      if (a.name !== undefined) {
+        const ok = layoutName !== undefined && (a.on_name_taken === "allow_suffix" ? nameOrSuffixed(layoutName, a.name) : layoutName.trim() === a.name);
+        if (!ok) mismatches.push(`the layout is named ${JSON.stringify(layoutName ?? null)}, asked ${JSON.stringify(a.name)}`);
+        else if (layoutName !== a.name) warnings.push(`the console named the layout ${JSON.stringify(layoutName)} (the name was taken)`);
+      }
+      if (stopped) mismatches.push(`stopped after ${placed.length} of ${build.length} elements: ${stopped}`);
+      verification = mismatches.length ? { status: "mismatched", checked, detail: mismatches.join("; ") } : { status: "matched", checked };
+    }
+    return buildResult({
+      operation: op,
+      target,
+      steps,
+      verification,
+      warnings,
+      summary: verification.status === "matched" ? `Layout ${a.layout}${layoutName ? ` "${layoutName}"` : ""}: ${placed.length} element${placed.length === 1 ? "" : "s"} added and read back.` : undefined,
+      extra: { layout: a.layout, added: placed.length, ...(readBack ? { elements: readBack.length } : {}) },
+    });
+  });
 }
 
-const AUTHORING_NOTE = "Does not select fixtures, clear programmer values, invoke layout elements, or execute assigned macros or sequences. Uses existing bridge operations without Lua, OSC fallback or automatic replay. Preview reads and validates without mutations. Mutations are serialised within this server, without isolation from another operator or client. Every property write requires read-back; uncertain writes stop the plan and require inspection before retrying. Layout Viewer window setup, grid and fit settings are outside this tool.";
+/** gma3_layouts: the pool, or one layout's elements. */
+export async function readLayouts(ctx: ToolContext, a: { layout?: number; offset?: number }): Promise<unknown> {
+  if (a.layout === undefined) {
+    const r = (await ctx.bridge.request("children", { ref: "DataPool.Layouts", fields: ["No", "Name"], limit: 10000 })) as ChildList;
+    if (r?.enumerationError !== undefined && r.enumerationError !== null) throw new Error(`the Layout pool could not be listed: ${String(r.enumerationError)}`);
+    return {
+      layouts: (r.items ?? []).filter((i) => !i.invalid).map((i) => ({ no: Number(i.fields?.No ?? i.index), name: String(i.fields?.Name ?? i.name ?? ""), elements: (i as { childCount?: number }).childCount ?? null })),
+      total: r.total ?? null,
+    };
+  }
+  const exists = await readObjects(ctx.bridge, `Layout ${a.layout}`, ["Name"], 1);
+  const item = exists?.items?.[0];
+  if (!item || item.invalid) return { layout: a.layout, found: false };
+  const r = await readElements(ctx, a.layout, a.offset ?? 0);
+  return {
+    layout: a.layout,
+    found: true,
+    name: String(item.fields?.Name ?? item.name ?? ""),
+    total: r.total,
+    complete: r.complete,
+    ...(r.error ? { error: r.error } : {}),
+    elements: r.elements,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+const elementShape = z.object({
+  object: z.string().describe('One object: "Group 5", "Sequence 3", "Macro 2", "Preset 4.12", "MAtricks 1", "Quickey 4", "World 1", "View 2", "Plugin 1", "Fixture 101", "Timecode 1", "Timer 1".'),
+  x: z.number().int().optional().describe("PosX in layout units."),
+  y: z.number().int().optional().describe("PosY in layout units (MA's own tools place rows downwards with smaller y)."),
+  width: z.number().int().optional(),
+  height: z.number().int().optional(),
+  text: z.string().optional().describe("CustomTextText: a label on the element."),
+  name: z.string().optional().describe("The element's own name."),
+  action: z.string().optional().describe('What a tap does, e.g. "Go+", "Toggle", "Flash", "SelectFixtures" (default: the layout\'s default for the object).'),
+  appearance: z.string().optional().describe("An appearance by name."),
+  show_name: z.boolean().optional().describe("VisibilityObjectName."),
+  show_id: z.boolean().optional().describe("VisibilityID."),
+  border: z.boolean().optional().describe("VisibilityBorder."),
+  bar: z.boolean().optional().describe("VisibilityBar."),
+  value: z.boolean().optional().describe("VisibilityValue."),
+  text_size: z.string().optional().describe(`CustomTextSize: ${TEXT_SIZES.join(", ")}.`),
+  text_color: z.string().optional().describe('CustomTextColor, RRGGBBAA hex ("FFFFFFFF").'),
+  align_h: z.string().optional().describe(`CustomTextAlignmentH: ${ALIGN_H.join(", ")}.`),
+  align_v: z.string().optional().describe(`CustomTextAlignmentV: ${ALIGN_V.join(", ")}.`),
+});
+
 export const registerLayoutTools: RegisterTools = (server, ctx) => {
-  server.registerTool("gma3_layouts", {
-    title: "Read layouts and their elements",
-    description: "Read the Layout pool or one layout in an explicit data pool using children/objects/object. Returns bounded element pages, current element numbers, GUID identities, assigned object handles and geometry, action, appearance, custom text and visibility fields. schema optionally returns the layout's live property schema. Read-only; no selection, programmer, playback or Viewer window changes. An incomplete page is explicitly flagged; read all pages before planning a broad edit.",
-    inputSchema: readShape,
-  }, async (args) => json(await readLayouts(ctx, args)));
-  server.registerTool("gma3_edit_layout_elements", {
-    title: "Add, update or remove layout elements",
-    description: "Apply up to 100 explicit element edits in one existing layout and required data pool. Add requires integer x/y/width/height in layout units; positions are Int16 and dimensions 1..32767. Update/remove require the current element number and GUID from gma3_layouts; stale/duplicate identities, locks and read-only properties are refused. Never clears/rebuilds the layout. Add sends Store Layout n.k /NoConfirmation to append a blank element; assignment uses set Object with a resolved numeric address, never Assign At Layout n.k (which appends). Remove sends Delete Layout n.k /NoConfirmation for the confirmed GUID. Other supplied fields use one set each. Object assignment accepts Macro/Sequence/Group; replacing a different assignment requires replace_object:true. Actions are validated for the actual assigned object class. Appearance overrides use a global Appearance pool number, resolved and verified by encoded handle/address. Custom text preserves case, quotes and internal spaces; leading/trailing whitespace is refused because read-only bridge fields trim it. Custom text accepts RGBA hex colour, captured font-size enums and alignment; visibility accepts Visible/Hidden. Reads GUIDs and typed object handles separately, and verifies identities, supplied properties and object addresses after edits; visual rendering and actual action execution are not verified. " + AUTHORING_NOTE,
-    inputSchema: editShape,
-  }, async (args) => operation(() => editLayoutElements(ctx, args)));
-  server.registerTool("gma3_store_layout", {
-    title: "Create or update a layout",
-    description: "Create a new empty layout or update only supplied layout fields in an explicit data pool. Create refuses an occupied number; names are checked against the pool. Sends Store Layout n /NoConfirmation only for create, then one set request per supplied field, followed by objects read-back. It never deletes or rebuilds elements. Canvas coordinates and dimensions use integer layout units; position/size are Int16, view coordinates Int32, view scale a positive ratio (0.8 = 80%; console read-back displays percent). Verifies existence and supplied fields, not rendered appearance. " + AUTHORING_NOTE,
-    inputSchema: layoutShape,
-  }, async (args) => operation(() => storeLayout(ctx, args)));
+  server.registerTool(
+    "gma3_layouts",
+    {
+      title: "List layouts and their elements",
+      description:
+        "Read-only. Without layout: the Layout pool (number, name, element count). With layout: its elements in order: index, the object each shows ({class, name, addr}), PosX, PosY, Width, Height, Name, CustomTextText, Action, Appearance, Visibility* and text settings, as the console reads them. Build layouts with gma3_store_layout.",
+      inputSchema: {
+        layout: z.number().int().min(1).max(9999).optional().describe("One layout's elements."),
+        offset: z.number().int().min(0).optional().describe("Start at this element (0-based)."),
+      },
+    },
+    async (args) => {
+      try {
+        return json(await readLayouts(ctx, args as { layout?: number; offset?: number }));
+      } catch (err) {
+        return { content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }], isError: true };
+      }
+    },
+  );
+
+  server.registerTool(
+    "gma3_store_layout",
+    {
+      title: "Build a layout view",
+      description:
+        `Build Layout <layout> (the 2D touch views of the Layout pool) from elements, each one pool object (group, sequence, macro, preset, MAtricks, quickey, world, view, plugin, fixture, timecode, timer) with optional position, size, label text, tap action, appearance, visibility and text settings; and/or grid: { objects: "Sequence 1 Thru 12", columns, x, y, width, height, gap } lays a range out row by row. At most ${MAX_ELEMENTS} elements per call. ` +
+        "Pre-checks (nothing sent on failure): every object exists (grid.skip_missing leaves a range's empty numbers out), the layout slot is free unless overwrite: true (Delete Layout, then rebuild: its own settings are lost) or append: true (add after its elements), and the name is free in the pool (on_name_taken). " +
+        "Each element is one Assign <object> At Layout <layout>; the new element must be the layout's last and show that object (by address) before its properties are set, else the call stops. Read-back: every element's object and asked properties, and the name. preview: true lists the commands and sends nothing. Read layouts with gma3_layouts.",
+      inputSchema: {
+        layout: z.number().int().min(1).max(9999).describe("Layout pool number."),
+        name: z.string().optional().describe("The layout's name."),
+        on_name_taken: z.enum(ON_NAME_TAKEN).optional().describe('Another layout has the name: "refuse" (default) or "allow_suffix".'),
+        elements: z.array(elementShape).max(MAX_ELEMENTS).optional().describe("Elements in order."),
+        grid: z
+          .object({
+            objects: z.string().describe('A range: "Sequence 1 Thru 12", "Preset 4.1 Thru 4.8", "Group 1 + 3 + 5".'),
+            columns: z.number().int().describe("Elements per row."),
+            x: z.number().int().optional().describe("Left of the first element (default 0)."),
+            y: z.number().int().optional().describe("PosY of the first row (default 0); later rows go downwards (smaller y)."),
+            width: z.number().int().optional().describe("Element width (default 100)."),
+            height: z.number().int().optional().describe("Element height (default 100)."),
+            gap: z.number().int().optional().describe("Space between elements (default 10)."),
+            skip_missing: z.boolean().optional().describe("Leave out numbers of the range that are empty (default false: refuse)."),
+          })
+          .optional()
+          .describe("Lay a range out as a grid, after the elements."),
+        overwrite: z.boolean().optional().describe("Delete the existing layout and build it anew (default false: refuse)."),
+        append: z.boolean().optional().describe("Add the elements to the existing layout."),
+        preview: z.boolean().optional().describe("Report the commands; send nothing."),
+      },
+    },
+    async (args) => operation(() => storeLayout(ctx, args as StoreLayoutArgs)),
+  );
 };

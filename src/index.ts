@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { Gma3Bridge, BridgeError, BridgeUnreachableError } from "./bridge.js";
 import { OscSender } from "./osc.js";
+import { KeystrokeSender } from "./keystroke.js";
 import { helpDir, helpVersion, listHelpPages, lookupHelp } from "./help.js";
 import { docsClientFromEnvironment, lookupIndexedHelp } from "./docs.js";
 import { registerDocsTools } from "./tools/docs.js";
@@ -27,6 +28,7 @@ import { registerDialogTools } from "./tools/dialog.js";
 import { registerPhaserTools } from "./tools/phasers.js";
 import { registerPresetTools } from "./tools/presets.js";
 import { registerRecipeTools } from "./tools/recipes.js";
+import { registerPhaserRecipeTools } from "./tools/phaserrecipes.js";
 import { registerSpeedTools } from "./tools/speed.js";
 import { registerMacroTools } from "./tools/macros.js";
 import { registerTimecodeTools } from "./tools/timecode.js";
@@ -35,8 +37,10 @@ import { registerPositionTools } from "./tools/positions.js";
 import { registerCueListTools } from "./tools/cuelists.js";
 import { registerTypeStructureTools } from "./tools/typestructure.js";
 import { registerCellLayoutTools } from "./tools/celllayout.js";
-import { registerLayoutTools } from "./tools/layouts.js";
+import { registerLayoutEditTools } from "./tools/layoutedit.js";
 import { registerDmxOutputTools } from "./tools/dmxoutput.js";
+import { registerNetOutputTools } from "./tools/netoutput.js";
+import { registerUndoTools } from "./tools/undo.js";
 import { registerVariableTools } from "./tools/variables.js";
 import { registerOscTools } from "./tools/osc.js";
 import { registerShowTools } from "./tools/show.js";
@@ -45,6 +49,15 @@ import { setPropertyChecked } from "./tools/setproperty.js";
 import { registerTempoSyncTools, resyncPlayback, RESYNC_NOTE } from "./tools/temposync.js";
 import { annotatePlayback, readTargetState, registerLiveStateTools, stateAfterFrame } from "./tools/livestate.js";
 import { registerPoolUsageTools, shapeListing } from "./tools/poolusage.js";
+import { registerAnalysisTools } from "./tools/analysis.js";
+import { registerPoolObjectTools } from "./tools/poolobjects.js";
+import { registerBitmapTools } from "./tools/bitmaps.js";
+import { registerLayoutTools } from "./tools/layouts.js";
+import { registerAgendaTools } from "./tools/agenda.js";
+import { registerWorldFilterTools } from "./tools/worldsfilters.js";
+import { registerMvrTools } from "./tools/mvr.js";
+import { UndoGroups, inToolScope } from "./undo.js";
+import { withProgress } from "./progress.js";
 
 const env = process.env;
 const docsClient = docsClientFromEnvironment();
@@ -79,6 +92,16 @@ const server = new McpServer(
   },
 );
 
+// Every tool handler runs in a scope that names its tool, so an undo group (GMA3_UNDO_GROUPS, src/undo.ts) can be
+// named after the tool call it covers and excluded tools can be recognised, and in the call's progress scope.
+{
+  const register = server.registerTool.bind(server) as (...a: unknown[]) => unknown;
+  (server as unknown as { registerTool: (...a: unknown[]) => unknown }).registerTool = (name: unknown, config: unknown, handler: unknown) =>
+    register(name, config, (...args: unknown[]) =>
+      // The SDK passes the request's `extra` last: its progressToken turns on progress notifications (src/progress.ts).
+      inToolScope(String(name), () => withProgress(args[args.length - 1], () => (handler as (...a: unknown[]) => unknown)(...args))));
+}
+
 // Arbitrary Lua execution is a separately gated capability. The console-side switch (the plugin's
 // "lua" start argument, off by default) is the enforcement point; GMA3_ALLOW_LUA=0 additionally hides
 // the gma3_lua tool from this server so a deployment can rule it out regardless of console state.
@@ -89,13 +112,18 @@ const allowLuaTool = !/^(0|false|no|off)$/i.test((env.GMA3_ALLOW_LUA ?? "1").tri
 // existing single-command mutation tools and gma3_lua (arbitrary code cannot be classified as
 // read-only) take the same lock so a workflow is never split by them. This orders only this
 // process's own requests; it does not isolate anything from another console operator or client.
-const mutations = new MutationLock();
+// GMA3_UNDO_GROUPS=1: each tool call's mutation span is one console undo group (bridge 0.55.0); off by default.
+const undoGroups = new UndoGroups(bridge);
+const mutations = new MutationLock(undoGroups);
 const toolContext: ToolContext = {
   bridge,
   mutations,
+  undo: undoGroups,
   requestTimeoutMs: Number(env.GMA3_BRIDGE_TIMEOUT_MS ?? 15000),
   luaToolAllowed: allowLuaTool,
   osc: oscOptions,
+  oscCommand: osc,
+  keystroke: new KeystrokeSender(),
 };
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -681,7 +709,7 @@ server.registerTool(
 
 registerFixtureTools(server, toolContext);
 if (docsClient) registerDocsTools(server, docsClient);
-registerLayoutTools(server, toolContext);
+registerLayoutEditTools(server, toolContext);
 registerCueTools(server, toolContext);
 registerExecutorTools(server, toolContext);
 registerInspectionTools(server, toolContext);
@@ -698,6 +726,7 @@ registerGroupTools(server, toolContext);
 registerPresetTools(server, toolContext);
 registerPhaserTools(server, toolContext);
 registerRecipeTools(server, toolContext);
+registerPhaserRecipeTools(server, toolContext);
 registerSpeedTools(server, toolContext);
 registerMacroTools(server, toolContext);
 registerTimecodeTools(server, toolContext);
@@ -706,6 +735,9 @@ registerCueListTools(server, toolContext);
 registerTypeStructureTools(server, toolContext);
 registerCellLayoutTools(server, toolContext);
 registerDmxOutputTools(server, toolContext);
+// Passive sACN / Art-Net listener: read-only, no bridge, no mutation lock.
+registerNetOutputTools(server, toolContext);
+registerUndoTools(server, toolContext);
 registerVariableTools(server, toolContext);
 registerLiveStateTools(server, toolContext);
 registerOscTools(server, toolContext);
@@ -713,6 +745,13 @@ registerShowTools(server, toolContext);
 registerTagTools(server, toolContext);
 registerTempoSyncTools(server, toolContext);
 registerPoolUsageTools(server, toolContext);
+registerAnalysisTools(server, toolContext);
+registerPoolObjectTools(server, toolContext);
+registerBitmapTools(server, toolContext);
+registerLayoutTools(server, toolContext);
+registerAgendaTools(server, toolContext);
+registerWorldFilterTools(server, toolContext);
+registerMvrTools(server, toolContext);
 
 server.registerResource(
   "cheatsheet",

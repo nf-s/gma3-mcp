@@ -58,8 +58,8 @@ const WORKFLOW_TOOLS = [
   "gma3_assign_to_executor",
   "gma3_label_executor",
   "gma3_executor_configuration",
-  "gma3_layouts",
-  "gma3_store_layout",
+  "gma3_layout_elements",
+  "gma3_configure_layout",
   "gma3_edit_layout_elements",
   "gma3_fixture_attributes",
   "gma3_programmer",
@@ -92,6 +92,13 @@ const WORKFLOW_TOOLS = [
   "gma3_patch_remove_type",
   // SU-22 user-library upload
   "gma3_patch_library_add",
+  // #143 bitmaps
+  "gma3_bitmaps",
+  "gma3_image_add",
+  "gma3_build_bitmap",
+  // #146 layouts
+  "gma3_layouts",
+  "gma3_store_layout",
   // SU-07 fixture-type structure
   "gma3_patch_type_structure",
   // SU-08 cell layouts
@@ -142,6 +149,10 @@ const WORKFLOW_TOOLS = [
   "gma3_timecodes",
   "gma3_build_timecode",
   "gma3_timecode_transport",
+  // Show analysis (read-only)
+  "gma3_preset_usage",
+  "gma3_cue_diff",
+  "gma3_tracking_leaks",
 ];
 
 test("all pre-existing tools are still registered under their original names", async () => {

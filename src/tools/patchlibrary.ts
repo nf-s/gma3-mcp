@@ -63,6 +63,10 @@ export interface XmlElement {
   attrs: Record<string, string>;
   /** 0 for the root element. */
   depth: number;
+  /** Index of the parent element in the returned list (undefined for the root). */
+  parent?: number;
+  /** The element's own character data (entities decoded, CDATA included), when it has any (#149: MVR keeps values as text). */
+  text?: string;
 }
 
 const XML_NAME = "[A-Za-z_:][\\w:.-]*";
@@ -93,6 +97,13 @@ export function parseXml(text: string): XmlElement[] {
   const s = text.startsWith("﻿") ? text.slice(1) : text;
   const out: XmlElement[] = [];
   const stack: string[] = [];
+  /** out-index of each open element, parallel to stack. */
+  const open: number[] = [];
+  const addText = (t: string) => {
+    if (t === "" || open.length === 0) return;
+    const el = out[open[open.length - 1]];
+    el.text = (el.text ?? "") + t;
+  };
   let roots = 0;
   let i = 0;
   const fail = (why: string): never => {
@@ -121,8 +132,9 @@ export function parseXml(text: string): XmlElement[] {
     const lt = s.indexOf("<", i);
     const chunk = lt < 0 ? s.slice(i) : s.slice(i, lt);
     if (stack.length === 0 && /[^ \t\r\n]/.test(chunk)) fail("text outside the root element");
-    decode(chunk);
+    const decoded = decode(chunk);
     if (chunk.includes("]]>")) fail("]]> outside a CDATA section");
+    addText(decoded);
     if (lt < 0) break;
     i = lt;
     if (s.startsWith("<!--", i)) {
@@ -135,6 +147,7 @@ export function parseXml(text: string): XmlElement[] {
       if (stack.length === 0) fail("CDATA outside the root element");
       const e = s.indexOf("]]>", i + 9);
       if (e < 0) fail("an unclosed CDATA section");
+      addText(s.slice(i + 9, e));
       i = e + 3;
     } else if (s.startsWith("<!", i)) {
       fail("a DOCTYPE or other declaration (refused: no entities are resolved)");
@@ -153,8 +166,9 @@ export function parseXml(text: string): XmlElement[] {
     } else if (s.startsWith("</", i)) {
       END_TAG.lastIndex = i;
       const m = END_TAG.exec(s) ?? fail("a malformed end tag");
-      const open = stack.pop();
-      if (open !== m[1]) fail(open ? `</${m[1]}> closing <${open}>` : `</${m[1]}> with no open element`);
+      const closing = stack.pop();
+      open.pop();
+      if (closing !== m[1]) fail(closing ? `</${m[1]}> closing <${closing}>` : `</${m[1]}> with no open element`);
       i = END_TAG.lastIndex;
     } else {
       START_TAG.lastIndex = i;
@@ -168,8 +182,11 @@ export function parseXml(text: string): XmlElement[] {
         if (c) {
           i = TAG_CLOSE.lastIndex;
           if (stack.length === 0 && ++roots > 1) fail("a second root element");
-          out.push({ name, attrs, depth: stack.length });
-          if (!c[1]) stack.push(name);
+          out.push({ name, attrs, depth: stack.length, ...(open.length ? { parent: open[open.length - 1] } : {}) });
+          if (!c[1]) {
+            stack.push(name);
+            open.push(out.length - 1);
+          }
           break;
         }
         ATTRIBUTE.lastIndex = i;
@@ -289,6 +306,54 @@ interface AddArgs {
 
 const hex = (n: number) => n.toString(16).padStart(8, "0");
 
+export interface UploadedFile {
+  path?: string;
+  size?: number;
+  crc32?: string;
+  replaced?: boolean;
+  kind?: string;
+  format?: string;
+}
+
+/**
+ * Send a file's bytes over the bridge in chunks (patch.libraryAdd): kind "fixture" (default) into the user fixture
+ * library, "image" into gma3_library/media/images (bridge 0.57.0). Pushes a "write" step, or the failed step and a
+ * best-effort "clean_up" of the part file. Never retries.
+ */
+export async function uploadChunks(
+  ctx: ToolContext,
+  o: { file: string; bytes: Buffer; crc32: string; replace: boolean; kind?: "fixture" | "image" },
+  steps: StepResult[],
+): Promise<{ ok: true; added?: UploadedFile } | { ok: false; lost: boolean }> {
+  const t = ctx.requestTimeoutMs;
+  const chunks = Math.ceil(o.bytes.length / LIBRARY_ADD_CHUNK);
+  // The bridge keeps each upload's bytes apart by this id, so another client sending the same name cannot mix in.
+  const upload = randomBytes(8).toString("hex");
+  const kind = o.kind && o.kind !== "fixture" ? { kind: o.kind } : {};
+  let added: UploadedFile | undefined;
+  for (let i = 0; i < chunks; i++) {
+    const piece = o.bytes.subarray(i * LIBRARY_ADD_CHUNK, (i + 1) * LIBRARY_ADD_CHUNK);
+    try {
+      const res = (await ctx.bridge.request("patch.libraryAdd", { file: o.file, ...kind, upload, offset: i * LIBRARY_ADD_CHUNK, data: piece.toString("base64"), total: o.bytes.length, crc32: o.crc32, replace: o.replace, final: i === chunks - 1 }, t)) as UploadedFile;
+      if (i === chunks - 1) added = res;
+    } catch (err) {
+      const step = stepFromError("write", err, { op: "patch.libraryAdd", detail: { chunk: i + 1, chunks } });
+      steps.push(step);
+      // The bridge removes its part file on a refusal; after a lost reply it is removed here, best effort.
+      let partLeft: boolean | undefined;
+      try {
+        partLeft = ((await ctx.bridge.request("patch.libraryAdd", { file: o.file, ...kind, upload, abort: true }, t)) as { partLeft?: boolean }).partLeft;
+      } catch {
+        partLeft = undefined;
+      }
+      steps.push(asRead({ name: "clean_up", status: partLeft === false ? "succeeded" : "unknown", op: "patch.libraryAdd", detail: { partLeft: partLeft ?? "unknown" } }));
+      return { ok: false, lost: step.status === "unknown" };
+    }
+  }
+  steps.push({ name: "write", status: "succeeded", op: "patch.libraryAdd", detail: { chunks, ...added } });
+  return { ok: true, added };
+}
+
 export async function patchLibraryAdd(ctx: ToolContext, raw: AddArgs): Promise<OperationResult> {
   const op = "patch_library_add";
   const errors: string[] = [];
@@ -372,30 +437,9 @@ export async function patchLibraryAdd(ctx: ToolContext, raw: AddArgs): Promise<O
     }
     steps.push(asRead({ name: "check_library", status: "succeeded", op: "patch.libraryStat", detail: before }));
 
-    const chunks = Math.ceil(bytes.length / LIBRARY_ADD_CHUNK);
-    // The bridge keeps each upload's bytes apart by this id, so another client sending the same name cannot mix in.
-    const upload = randomBytes(8).toString("hex");
-    let added: { path?: string; size?: number; crc32?: string; replaced?: boolean } | undefined;
-    for (let i = 0; i < chunks; i++) {
-      const piece = bytes.subarray(i * LIBRARY_ADD_CHUNK, (i + 1) * LIBRARY_ADD_CHUNK);
-      try {
-        const res = (await ctx.bridge.request("patch.libraryAdd", { file, upload, offset: i * LIBRARY_ADD_CHUNK, data: piece.toString("base64"), total: bytes.length, crc32: sum, replace: raw.replace === true, final: i === chunks - 1 }, t)) as typeof added;
-        if (i === chunks - 1) added = res;
-      } catch (err) {
-        const step = stepFromError("write", err, { op: "patch.libraryAdd", detail: { chunk: i + 1, chunks } });
-        steps.push(step);
-        // The bridge removes its part file on a refusal; after a lost reply it is removed here, best effort.
-        let partLeft: boolean | undefined;
-        try {
-          partLeft = ((await ctx.bridge.request("patch.libraryAdd", { file, upload, abort: true }, t)) as { partLeft?: boolean }).partLeft;
-        } catch {
-          partLeft = undefined;
-        }
-        steps.push(asRead({ name: "clean_up", status: partLeft === false ? "succeeded" : "unknown", op: "patch.libraryAdd", detail: { partLeft: partLeft ?? "unknown" } }));
-        return buildResult({ operation: op, target, steps, verification: unavailable(step.status === "unknown" ? "the last chunk's reply was lost; read the library with gma3_patch_library" : "the file was not written") });
-      }
-    }
-    steps.push({ name: "write", status: "succeeded", op: "patch.libraryAdd", detail: { chunks, ...added } });
+    const sent = await uploadChunks(ctx, { file, bytes, crc32: sum, replace: raw.replace === true }, steps);
+    if (!sent.ok) return buildResult({ operation: op, target, steps, verification: unavailable(sent.lost ? "the last chunk's reply was lost; read the library with gma3_patch_library" : "the file was not written") });
+    const added = sent.added;
 
     let after: Stat | undefined;
     let entry: LibraryEntry | undefined;

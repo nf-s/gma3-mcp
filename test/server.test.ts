@@ -116,6 +116,47 @@ test("gma3_command returns bridge feedback when the bridge replies", async () =>
   assert.equal(bridgeRequests.at(-1)?.op, "cmd");
 });
 
+test("undo groups are off by default: a tool call sends no undo.open / undo.close", async () => {
+  bridgeMode = "reply";
+  const from = bridgeRequests.length;
+  const res = await client.callTool({ name: "gma3_command", arguments: { command: "Go+ Sequence 2" } });
+  assert.equal(isError(res), false, textOf(res));
+  assert.deepEqual(bridgeRequests.slice(from).map((r) => r.op), ["cmd"]);
+});
+
+test("GMA3_UNDO_GROUPS=1: a tool call's commands are one undo group named after the tool", async () => {
+  bridgeMode = "reply";
+  const grouped = await startServer({ GMA3_UNDO_GROUPS: "1" });
+  const from = bridgeRequests.length;
+  const res = await grouped.callTool({ name: "gma3_command", arguments: { command: "Go+ Sequence 3" } });
+  assert.equal(isError(res), false, textOf(res));
+  assert.deepEqual(
+    bridgeRequests.slice(from).map((r) => [r.op, r.args]),
+    [
+      ["undo.open", { name: "gma3_command" }],
+      ["cmd", { command: "Go+ Sequence 3" }],
+      ["undo.close", {}],
+    ],
+  );
+});
+
+test("progress (#145): a call with a progressToken gets notifications/progress; one without gets none", async () => {
+  bridgeMode = "reply";
+  const seen: unknown[] = [];
+  const other: string[] = [];
+  client.fallbackNotificationHandler = async (n) => void other.push(n.method);
+  const res = await client.callTool({ name: "gma3_command", arguments: { command: "Go+ Sequence 4" } }, undefined, { onprogress: (p) => void seen.push(p) });
+  assert.equal(isError(res), false, textOf(res));
+  assert.ok(seen.length >= 1, "at least one progress notification");
+  const first = seen[0] as { progress: number; total?: number };
+  assert.ok(first.progress > 0 && first.progress < 1, `a beat stays below the first unit: ${first.progress}`);
+  const quiet = await client.callTool({ name: "gma3_command", arguments: { command: "Go+ Sequence 5" } });
+  assert.equal(isError(quiet), false, textOf(quiet));
+  await sleep(50);
+  assert.deepEqual(other.filter((m) => m === "notifications/progress"), [], "no progress without a token");
+  client.fallbackNotificationHandler = undefined;
+});
+
 test("a command the bridge accepted but never answered is NOT resent over OSC", async () => {
   bridgeMode = "silent";
   oscMessages.length = 0;
@@ -195,3 +236,4 @@ test("gma3_lua is registered by default and hidden by GMA3_ALLOW_LUA=0", async (
   assert.ok(!restrictedNames.includes("gma3_lua"));
   assert.ok(restrictedNames.includes("gma3_command"));
 });
+

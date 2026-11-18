@@ -157,7 +157,7 @@ local my_handle     = select(4, ...)
 local socket = require("socket")
 local json   = require("json")
 
-local VERSION      = "0.50.1"
+local VERSION      = "0.58.1"
 local DEFAULT_PORT = 9800
 -- Execution policy defaults for the "lua" op (see header). Changed per start with the
 -- "luatime=<ms>" / "luasteps=<n>" tokens, or at runtime with "lua on|off".
@@ -2544,8 +2544,16 @@ ops.ping = function(args)
   pcall(function() showfile = Root().MANetSocket:Get("ShowFile") end)
   local hostname
   pcall(function() hostname = Root().maNetSocket.hostname end)
+  -- The show file's state (0.53.0, from silly82): unsaved changes and the file status (ShowLoaded, ShowSaving, ...).
+  local show = {}
+  local okN, need = pcall(NeedShowSave)
+  if okN and need ~= nil then show.saveNeeded = need == true end
+  local okS, st = pcall(GetShowFileStatus)
+  if okS and st ~= nil then show.fileStatus = tostring(st) end
   return {
     bridgeVersion = VERSION,
+    instance      = state.instance,
+    show          = next(show) ~= nil and show or nil,
     host          = state.host,
     port          = state.port,
     luaVersion    = _VERSION,
@@ -2854,9 +2862,218 @@ ops["control.recover"] = function(args)
   return r
 end
 
-ops.cmd = function(args)
+-------------------------------------------------------------------------------
+-- Undo groups (0.55.0, from silly82/gma3-mcp; probe docs/probes/undo-and-hooks-macos-2.5.1.md)
+-------------------------------------------------------------------------------
+-- CreateUndo(name) returns a handle; Cmd(c, handle) joins it and CloseUndo(handle) makes the group one Oops step. An
+-- empty group adds no step. Only commands of the `cmd` op from the connection that opened the group join it: property
+-- writes (set), CmdIndirect sends (patch sessions, show load/save, recipe editing, library import) and Lua do not.
+-- While a group is open the console answers Oops with "Not possible at the moment", so a command naming Oops closes
+-- the group first. The server opens and closes one group per tool call only when GMA3_UNDO_GROUPS is on.
+ops["undo.open"] = function(args, ctx)
+  local name = args.name
+  if type(name) ~= "string" or name == "" then error("args.name (string) is required") end
+  name = name:sub(1, 60)
+  local replaced
+  if state.undo then
+    local ok = pcall(CloseUndo, state.undo.handle)
+    replaced = { name = state.undo.name, commands = state.undo.commands, closed = ok }
+    state.undo = nil
+  end
+  local ok, h = pcall(CreateUndo, "MCP " .. name)
+  if not ok or h == nil then error("CreateUndo failed: " .. tostring(h)) end
+  state.undo = { handle = h, name = name, client = ctx and ctx.client, commands = 0 }
+  return { open = true, name = name, replaced = replaced }
+end
+
+ops["undo.close"] = function(args, ctx)
+  local g = state.undo
+  if not g then return { closed = false, note = "no group was open" } end
+  if ctx and g.client ~= ctx.client then return { closed = false, note = "the open group belongs to another connection" } end
+  state.undo = nil
+  local ok, r = pcall(CloseUndo, g.handle)
+  local closed = ok and r ~= false
+  -- 0.56.0: a closed group with commands is one Oops step; it is remembered (newest last, at most 50) so
+  -- undo.undo can check that it is still the console's latest step and Oops exactly it. An empty group adds no step.
+  local id
+  if closed and g.commands > 0 then
+    state.undoSeq = (state.undoSeq or 0) + 1
+    id = tostring(state.instance or "0") .. ":" .. state.undoSeq
+    local hist = state.undoHistory or {}
+    state.undoHistory = hist
+    hist[#hist + 1] = { id = id, handle = g.handle, name = g.name, client = g.client, commands = g.commands, closedAt = os.time() }
+    while #hist > 50 do table.remove(hist, 1) end
+  end
+  return { closed = closed, id = id, name = g.name, commands = g.commands, error = (not ok) and tostring(r) or nil }
+end
+
+-- undo.undo {ids, preview} (0.56.0): Oops the groups with these ids (newest first), one Oops each, but only after
+-- checking that they are exactly the console's latest undo steps, in that order. The undo list is read through the
+-- group handle: CreateUndo answers an object (Root 20.1.1.1.1 on onPC 2.5.1), whose parent is taken as the list and
+-- whose last child as the latest step (the Oops menu lists the latest at the bottom). Not verified on a console yet;
+-- anything that cannot be read refuses, nothing falls back to a blind Oops. Each Oops is read back: the group's
+-- handle must be gone from the list (or invalid) before the next one is sent. The ids are the ownership check: a
+-- server only knows the ids undo.close answered it (a reconnect does not lose them).
+;(function()
+  local function hexOf(h)
+    local ok, s = pcall(HandleToStr, h)
+    if ok and type(s) == "string" and s ~= "" then return s:upper() end
+    return nil
+  end
+  local function isValid(h)
+    local ok, v = pcall(IsObjectValid, h)
+    if not ok then return nil end
+    return v ~= false and v ~= nil
+  end
+  -- The undo list a group handle belongs to (its parent), or nil + why.
+  local function listOf(h)
+    local okP, parent = pcall(function() return h:Parent() end)
+    if not okP or parent == nil then return nil, "the console's undo list (the group's parent) could not be read" end
+    return parent
+  end
+  -- The list's steps, newest first, as { hex, name } (at most `n`; all when n is nil); nil + why when unreadable.
+  local function latest(list, n)
+    local okC, kids = pcall(function() return list:Children() end)
+    if not okC or type(kids) ~= "table" then return nil, "the console's undo list could not be listed" end
+    local out = {}
+    for i = #kids, n and math.max(1, #kids - n + 1) or 1, -1 do
+      local k = kids[i]
+      local hex = hexOf(k)
+      -- An identity that cannot be read proves nothing: the whole read is unreadable (review of #154).
+      if not hex then return nil, "undo step " .. (#kids - i + 1) .. " from the top of the console's undo list cannot be identified" end
+      out[#out + 1] = { hex = hex, name = safeProp(k, "name") }
+    end
+    return out
+  end
+  local function find(id)
+    for i, rec in ipairs(state.undoHistory or {}) do if rec.id == id then return rec, i end end
+    return nil
+  end
+  local function forget(id)
+    local _, i = find(id)
+    if i then table.remove(state.undoHistory, i) end
+  end
+  local function brief(rec) return { id = rec.id, name = rec.name, commands = rec.commands, closedAt = rec.closedAt } end
+
+  ops["undo.list"] = function()
+    local out = {}
+    for i = #(state.undoHistory or {}), 1, -1 do out[#out + 1] = brief(state.undoHistory[i]) end
+    return { groups = emptyArray(out), open = state.undo and { name = state.undo.name, commands = state.undo.commands } or nil }
+  end
+
+  ops["undo.undo"] = function(args, ctx)
+    local ids = args.ids
+    if type(ids) ~= "table" or #ids == 0 or #ids > 20 then error("args.ids (1-20 group ids, newest first) is required") end
+    if state.undo then
+      local whose = (ctx and state.undo.client == ctx.client) and "this connection" or "another connection"
+      raise({ code = "group-open", message = "an undo group of " .. whose .. " (" .. tostring(state.undo.name) .. ") is open; the console refuses Oops until it is closed" })
+    end
+    local recs = {}
+    for i, id in ipairs(ids) do
+      local rec = find(id)
+      if not rec then raise({ code = "unknown-group", message = "undo group " .. tostring(id) .. " is not known to this bridge run (it restarted, or the group was undone or dropped)", id = id }) end
+      local valid = isValid(rec.handle)
+      if valid == false then
+        forget(id)
+        raise({ code = "group-gone", message = "undo group " .. id .. " (" .. tostring(rec.name) .. ") is no longer on the console (Oopsed already, or a show load or patch change cleared the undo list)", id = id })
+      end
+      rec.hex = rec.hex or hexOf(rec.handle)
+      if not rec.hex then raise({ code = "unreadable", message = "undo group " .. id .. "'s handle cannot be read; nothing was undone", id = id }) end
+      recs[i] = rec
+    end
+    local list, why = listOf(recs[1].handle)
+    local top
+    if list then top, why = latest(list, #recs) end
+    if not top then raise({ code = "unreadable", message = why .. "; nothing was undone" }) end
+    for i, rec in ipairs(recs) do
+      local t = top[i]
+      if not t or t.hex ~= rec.hex then
+        raise({
+          code = "not-latest",
+          message = "the console's " .. (i == 1 and "latest undo step" or ("undo step " .. i .. " from the top")) .. " is " ..
+            (t and ("\"" .. tostring(t.name) .. "\"") or "missing") .. ", not this server's group " .. rec.id .. " (" .. tostring(rec.name) ..
+            "): something was done on the console since; nothing was undone",
+          latest = emptyArray(top), expected = rec.id,
+        })
+      end
+    end
+    local groups = {}
+    for i, rec in ipairs(recs) do groups[i] = brief(rec) end
+    if args.preview then return { preview = true, groups = emptyArray(groups), latest = emptyArray(top) } end
+    -- Interaction admission (KB-05), as handleLine applies it to cmd: no Oops while input ownership is active. Only
+    -- here, after the read-only checks, so preview stays available like every other read (review of #154).
+    local busy = inputBusy()
+    if busy then
+      raise({ code = "busy", message = "an Oops is refused while input ownership is active: " .. tostring(busy.description) ..
+                ". Reads stay available; the owner ends its interaction (input.end), releases its keys, or the sequence finishes first; nothing was undone",
+              reason = busy.reason, owner = busy.owner, interaction = busy.interaction, sequence = busy.sequence, hold = busy.hold,
+              remainingMs = busy.remainingMs, module = busy.module, device = busy.device, control = busy.control })
+    end
+    local undone = {}
+    for i, rec in ipairs(recs) do
+      local okC, feedback = pcall(Cmd, "Oops")
+      -- Read back: the group's handle is invalid, or every step left in the list is identified and none is the group.
+      -- A list that cannot be read in full proves nothing: the group stays remembered and no further Oops is sent.
+      local gone, unreadable = isValid(rec.handle) == false, nil
+      if not gone then
+        local after, why = latest(list)
+        if after then
+          gone = true
+          for _, t in ipairs(after) do if t.hex == rec.hex then gone = false end end
+        else
+          unreadable = why
+        end
+      end
+      undone[#undone + 1] = { id = rec.id, name = rec.name, feedback = okC and feedback or nil, error = (not okC) and tostring(feedback) or unreadable, gone = gone, unreadable = unreadable and true or nil }
+      if gone then forget(rec.id) end
+      if not okC or not gone then
+        local what = not okC and ("failed: " .. tostring(feedback))
+          or unreadable and ("ran, but the read-back failed (" .. unreadable .. "): whether the group was undone is unknown, so it stays remembered")
+          or "ran, but the group is still in the console's undo list"
+        raise({ code = unreadable and "readback-unreadable" or "oops-failed", message = "Oops for undo group " .. rec.id .. " (" .. tostring(rec.name) .. ") " .. what .. "; " .. (i - 1) .. " group(s) were undone before it and no further Oops was sent", undone = emptyArray(undone) })
+      end
+    end
+    local now = latest(list, 1)
+    return { undone = emptyArray(undone), remaining = #(state.undoHistory or {}), latestAfter = now and now[1] or nil }
+  end
+end)()
+
+ops.cmd = function(args, ctx)
   local command = args.command or args.cmd
   if type(command) ~= "string" or command == "" then error("args.command (string) is required") end
+  local g = state.undo
+  if g and ctx and g.client == ctx.client then
+    -- An executable Oops (review of #136): text in single or double quotes is data (Label Macro 5 "Oops", or
+    -- 'x; Oops'), so the line is scanned with both quote styles skipped, split on ";" outside quotes, and a command
+    -- whose first word is Oops counts. An unterminated quote runs to the end of the line, as in refTokens.
+    local runsOops, quote, part = false, nil, {}
+    local function flush()
+      if table.concat(part):lower():match("^%s*oops%f[%A]") then runsOops = true end
+      part = {}
+    end
+    for i = 1, #command do
+      local c = command:sub(i, i)
+      if quote then
+        if c == quote then quote = nil end
+      elseif c == '"' or c == "'" then
+        quote = c
+        part[#part + 1] = "_"
+      elseif c == ";" then
+        flush()
+      else
+        part[#part + 1] = c
+      end
+    end
+    flush()
+    if runsOops then
+      -- Oops acts on the steps before it, as typed: the group is closed first.
+      state.undo = nil
+      pcall(CloseUndo, g.handle)
+    else
+      g.commands = g.commands + 1
+      return { command = command, feedback = Cmd(command, g.handle), undoGroup = g.name }
+    end
+  end
   local feedback = Cmd(command)
   return { command = command, feedback = feedback }
 end
@@ -3487,7 +3704,7 @@ end
 -- moves the same command line, so patch.enter refuses while the copy is open, the destination is not
 -- Root, or a modal is open. Every mutating op needs exclusive = true: the client confirms that nobody
 -- else edits the show while a session runs. patch.fingerprint is best-effort detection of foreign
--- changes, read one collection per request; it is not a consistent snapshot, which is why exclusive use
+-- changes, read one collection (since 0.51.0 a bounded part of one) per request; it is not a consistent snapshot, which is why exclusive use
 -- is required rather than implied.
 -------------------------------------------------------------------------------
 
@@ -3676,10 +3893,15 @@ local function fixtureMode(c)
   return nil
 end
 
+-- A property in the display role, as text. A multi-break fixture with no break patched displays its Patch as ","
+-- (onPC 2.5.1, live 2026-10-21: Break1 and Break2 raw -1); that is returned as "", like any unpatched fixture, so every
+-- report and comparison of patch text treats it as unpatched. A partly patched one ("3.202,") is kept as it reads.
 local function displayProp(c, k)
   local ok, v = pcall(function() return c:Get(k, Enums.Roles.Display) end)
-  if ok and v ~= nil then return tostring(v) end
-  return nil
+  if not ok or v == nil then return nil end
+  v = tostring(v)
+  if k == "Patch" and v:match("^[%s,]*$") then return "" end
+  return v
 end
 
 local function numericFid(c)
@@ -3993,8 +4215,24 @@ ops["patch.check"] = function(args)
       rows[#rows + 1] = entry and { fid = fid, exists = true, current = fixtureRow(entry) } or { fid = fid, exists = false }
     end
     res.fixtures = emptyArray(rows)
+  elseif type(args.ranges) == "table" then
+    -- #149 (bridge 0.58.0): fixtures that are not in the show yet (an MVR import), each { fid, address?, footprint? }:
+    -- per FID whether it is free, and every DMX range against the live patch and the other requested ranges.
+    local proposed, rows = {}, {}
+    for _, e in ipairs(args.ranges) do
+      local fid = integerArg(e.fid, "ranges[].fid", 1, PATCH_MAX_FID)
+      rows[#rows + 1] = { fid = fid, free = CheckFIDCollision(fid, 1) == true }
+      if e.address ~= nil then
+        local start = parseDmx(e.address)
+        if not start then raise("[bad-args] ranges[].address must be U.AAA (universe 1-1024, address 1-512)") end
+        local fp = integerArg(e.footprint, "ranges[].footprint", 1, 512)
+        proposed[#proposed + 1] = { fid = fid, first = start.abs, last = start.abs + fp - 1 }
+      end
+    end
+    res.fids = emptyArray(rows)
+    res.conflicts, res.occupancyUnknown = rangeConflicts(lp, proposed, {})
   else
-    raise("[bad-args] patch.check needs add, edits or fids")
+    raise("[bad-args] patch.check needs add, edits, fids or ranges")
   end
   return res
 end
@@ -4118,13 +4356,21 @@ ops["patch.add"] = function(args)
   return { added = true, ret = tostring(ret), type = { no = safeProp(ft, "no"), name = tostring(safeProp(ft, "name")) }, mode = modeOut(info), created = emptyArray(created), patchedByBridge = setByBridge }
 end
 
--- Readdress, unpatch or rename fixtures in the copy. Every addressed fixture is unpatched first and then
--- given its new address, so swaps work; the new ranges are checked against every other range of the copy,
--- and on any problem every change of this call is restored and the op fails.
+-- Readdress, unpatch or rename fixtures in the copy (bridge 0.51.0). Each Set in the copy can be slow on a large show:
+-- 22 readdresses done as 22 unpatches and 22 Sets failed on onPC 2.5.1 (2026-10-21), probably because the request
+-- outlived the client's 15 s timeout (not established). So the op sends only the Sets it needs:
+--   - a fixture whose current range a new range of this call overlaps (its own new range included) is unpatched
+--     first, so swaps and moves across a fixture's own range work; any other readdress is one Set("Patch", new)
+--     (KB-25: a patched fixture readdressed directly). A fixture whose range cannot be read is unpatched first;
+--   - a multi-break fixture is unpatched break by break, the highest first (Set("Break<n>", "")): Set("Patch", "")
+--     leaves its breaks as they are (live 2026-10-21). Readdressing one is refused.
+-- The new ranges are checked against every other range of the copy. On any problem every change of this call is put
+-- back (a multi-break fixture break by break) and read back, and the error says whether that restore was verified.
 ops["patch.set"] = function(args)
   requireExclusive(args, "patch.set")
   local p = requireCopy(nil)
   if type(args.edits) ~= "table" or #args.edits == 0 then raise("[bad-args] edits must be a non-empty list") end
+  local started = now()
   local by = fixturesByFid(p)
   local edits, seen = {}, {}
   for _, e in ipairs(args.edits) do
@@ -4133,37 +4379,107 @@ ops["patch.set"] = function(args)
     seen[fid] = true
     local entry = by[fid]
     if not entry then raise("[no-fixture] no fixture with FID " .. fid .. " in the copy") end
-    local ed = { fid = fid, entry = entry, name = nameArg(e.name, "edits[].name") }
+    local ed = { fid = fid, entry = entry, fixture = entry.fixture, name = nameArg(e.name, "edits[].name") }
     if e.address ~= nil then
+      local mode = fixtureMode(entry.fixture)
+      local info = mode and modeInfo(mode) or { breaks = {} }
+      ed.multi = #info.breaks > 1
       if e.address == "" then ed.address = ""
       else
         local d = parseDmx(e.address)
         if not d then raise("[bad-args] edits[].address must be U.AAA or \"\" (unpatch)") end
         ed.address = formatDmx(d.abs)
-        local mode = fixtureMode(entry.fixture)
-        local info = mode and modeInfo(mode) or { breaks = {} }
         if #info.breaks > 1 then raise("[multi-break] FID " .. fid .. " uses a multi-break mode; readdressing it is not supported") end
         if not info.footprint or info.footprint < 1 then raise("[no-footprint] FID " .. fid .. " has no DMX footprint to patch") end
+        ed.first, ed.last = d.abs, d.abs + info.footprint - 1
       end
     end
     if ed.address == nil and ed.name == nil then raise("[bad-args] edit for FID " .. fid .. " changes nothing (give address and/or name)") end
     edits[#edits + 1] = ed
   end
+  -- A fixture's patched breaks ({b, address}, from Break1-Break8 in the display role) and its whole patch as one text.
+  local function breaksOf(c)
+    local out = {}
+    for b = 1, 8 do
+      local v = displayProp(c, "Break" .. b)
+      if v and v ~= "" then out[#out + 1] = { b = b, address = v } end
+    end
+    return out
+  end
+  local function patchState(c)
+    local t = { displayProp(c, "Patch") or "?" }
+    for _, x in ipairs(breaksOf(c)) do t[#t + 1] = x.b .. "=" .. x.address end
+    return table.concat(t, ";")
+  end
   local orig = {}
-  for _, ed in ipairs(edits) do orig[ed.fid] = { patch = displayProp(ed.entry.fixture, "Patch") or "", name = tostring(safeProp(ed.entry.fixture, "name")) } end
-  local function restore()
-    for _, ed in ipairs(edits) do pcall(function() ed.entry.fixture:Set("Patch", "") end) end
-    for _, ed in ipairs(edits) do
-      local o = orig[ed.fid]
-      pcall(function() ed.entry.fixture:Set("Patch", o.patch) end)
-      pcall(function() ed.entry.fixture:Set("Name", o.name) end)
+  for _, ed in ipairs(edits) do
+    local o = { patch = displayProp(ed.fixture, "Patch") or "", name = tostring(safeProp(ed.fixture, "name")), breaks = breaksOf(ed.fixture), state = patchState(ed.fixture) }
+    orig[ed.fid] = o
+    -- A break beyond the first patched makes it multi-break even when its mode cannot be read.
+    if ed.address ~= nil then for _, x in ipairs(o.breaks) do if x.b > 1 then ed.multi = true end end end
+  end
+  local sets = 0
+  local function set(c, k, v) sets = sets + 1; c:Set(k, v) end
+  local function unpatch(ed)
+    if ed.multi then
+      local list = breaksOf(ed.fixture)
+      for i = #list, 1, -1 do set(ed.fixture, "Break" .. list[i].b, "") end
+    else
+      set(ed.fixture, "Patch", "")
     end
   end
+  -- Which readdressed fixtures are in the way of a new range (their own included), read before any Set.
+  local first = {}
+  for _, ed in ipairs(edits) do
+    if ed.first then
+      local rs, why = fixtureRanges(ed.fixture)
+      if why then first[ed.fid] = true end
+      for _, r in ipairs(rs) do
+        for _, n in ipairs(edits) do
+          if n.first and r.first <= n.last and n.first <= r.last then first[ed.fid] = true end
+        end
+      end
+    end
+  end
+  local unpatchedFirst = {}
   local okE, errE = pcall(function()
-    for _, ed in ipairs(edits) do if ed.address ~= nil then ed.entry.fixture:Set("Patch", "") end end
-    for _, ed in ipairs(edits) do if ed.address ~= nil and ed.address ~= "" then ed.entry.fixture:Set("Patch", ed.address) end end
-    for _, ed in ipairs(edits) do if ed.name ~= nil then ed.entry.fixture:Set("Name", ed.name) end end
+    for _, ed in ipairs(edits) do
+      if ed.address == "" or first[ed.fid] then
+        unpatch(ed)
+        if ed.address ~= "" then unpatchedFirst[#unpatchedFirst + 1] = ed.fid end
+      end
+    end
+    for _, ed in ipairs(edits) do if ed.first then set(ed.fixture, "Patch", ed.address) end end
+    for _, ed in ipairs(edits) do if ed.name ~= nil then set(ed.fixture, "Name", ed.name) end end
   end)
+  -- Put back what this call changed: clear every changed fixture first (so a put-back address never meets a fixture
+  -- that moved there), then its original breaks and the names. Returns what still differs afterwards.
+  local function restore()
+    local changed = {}
+    for _, ed in ipairs(edits) do if ed.address ~= nil and patchState(ed.fixture) ~= orig[ed.fid].state then changed[#changed + 1] = ed end end
+    for _, ed in ipairs(changed) do pcall(unpatch, ed) end
+    for _, ed in ipairs(changed) do
+      local o = orig[ed.fid]
+      if ed.multi then
+        for _, x in ipairs(o.breaks) do pcall(set, ed.fixture, "Break" .. x.b, x.address) end
+      elseif o.patch ~= "" then
+        pcall(set, ed.fixture, "Patch", o.patch)
+      end
+    end
+    for _, ed in ipairs(edits) do
+      if ed.name ~= nil and tostring(safeProp(ed.fixture, "name")) ~= orig[ed.fid].name then pcall(set, ed.fixture, "Name", orig[ed.fid].name) end
+    end
+    local wrong = {}
+    for _, ed in ipairs(edits) do
+      local o = orig[ed.fid]
+      if patchState(ed.fixture) ~= o.state then
+        wrong[#wrong + 1] = "FID " .. ed.fid .. " reads patch " .. (displayProp(ed.fixture, "Patch") or "?") .. ", was " .. (o.patch == "" and "unpatched" or o.patch)
+      elseif tostring(safeProp(ed.fixture, "name")) ~= o.name then
+        wrong[#wrong + 1] = "FID " .. ed.fid .. " reads name " .. tostring(safeProp(ed.fixture, "name")) .. ", was " .. o.name
+      end
+    end
+    return wrong
+  end
   local problem, conflicts
   if not okE then problem = "a Set raised: " .. tostring(errE) end
   if not problem then
@@ -4171,13 +4487,14 @@ ops["patch.set"] = function(args)
     for _, ed in ipairs(edits) do
       if ed.address ~= nil then
         ignore[ed.fid] = true
-        local rs, why = fixtureRanges(ed.entry.fixture)
+        local rs, why = fixtureRanges(ed.fixture)
         if why then problem = "FID " .. ed.fid .. ": " .. why end
         for _, r in ipairs(rs) do ranges[#ranges + 1] = { fid = ed.fid, first = r.first, last = r.last } end
-        local now = displayProp(ed.entry.fixture, "Patch") or ""
-        if now ~= ed.address then problem = "FID " .. ed.fid .. " reads back patch " .. now .. ", not " .. (ed.address == "" and "unpatched" or ed.address) end
+        local got = displayProp(ed.fixture, "Patch") or ""
+        if got ~= ed.address then problem = "FID " .. ed.fid .. " reads back patch " .. got .. ", not " .. (ed.address == "" and "unpatched" or ed.address)
+        elseif ed.address == "" and #breaksOf(ed.fixture) > 0 then problem = "FID " .. ed.fid .. " still has a DMX break patched after the unpatch" end
       end
-      if ed.name ~= nil and tostring(safeProp(ed.entry.fixture, "name")) ~= ed.name then problem = "FID " .. ed.fid .. " reads back name " .. tostring(safeProp(ed.entry.fixture, "name")) end
+      if ed.name ~= nil and tostring(safeProp(ed.fixture, "name")) ~= ed.name then problem = "FID " .. ed.fid .. " reads back name " .. tostring(safeProp(ed.fixture, "name")) end
     end
     local unknown
     conflicts, unknown = rangeConflicts(p, ranges, ignore)
@@ -4186,12 +4503,17 @@ ops["patch.set"] = function(args)
     if not problem and #conflicts > 0 then problem = "the new addresses overlap patched fixtures" end
   end
   if problem then
-    restore()
-    raise({ code = "set-failed", message = problem .. "; every change of this call was restored in the copy", conflicts = conflicts })
+    local wrong = restore()
+    local restored = #wrong == 0 and "; every change of this call was restored in the copy"
+      or ("; THE RESTORE COULD NOT BE VERIFIED (" .. table.concat(wrong, "; ") .. "): the copy may still hold part of this call's change")
+    raise({ code = "set-failed", message = problem .. restored, conflicts = conflicts, restored = #wrong == 0, unrestored = emptyArray(wrong), sets = sets, ms = math.floor((now() - started) * 1000 + 0.5) })
   end
   local rows = {}
-  for _, ed in ipairs(edits) do rows[#rows + 1] = { fid = ed.fid, before = orig[ed.fid], after = fixtureRow(ed.entry) } end
-  return { set = true, edits = emptyArray(rows) }
+  for _, ed in ipairs(edits) do
+    local o = orig[ed.fid]
+    rows[#rows + 1] = { fid = ed.fid, before = { patch = o.patch, name = o.name }, after = fixtureRow(ed.entry) }
+  end
+  return { set = true, edits = emptyArray(rows), sets = sets, unpatchedFirst = emptyArray(unpatchedFirst), ms = math.floor((now() - started) * 1000 + 0.5) }
 end
 
 -- Delete fixtures from the copy by FID. Fixtures with sub-fixtures are refused (nothing is deleted).
@@ -4275,7 +4597,14 @@ end
 --                 children as the guide's matching container has. Every other container, the inside of every
 --                 existing type and every other collection are compared in full: an unrelated addition (a
 --                 fixture, a mode in an existing type) still differs.
-local PATCH_FP_SKIP = { DmxAddresses = true, UIChannels = true, RTChannels = true, FixtureTypesOverview = true, PatchFilter = true }
+--   budgetMs, maxObjects, resume   (bridge 0.51.0) a bounded part of one collection per request. On a large show
+--                 one request, presumably for FixtureTypes, outlived the client's 15 s timeout, and the bridge, which
+--                 cannot be interrupted, answered nothing for minutes (live 2026-10-21, 61 types with geometry). The walk now
+--                 stops once it has hashed for budgetMs (or maxObjects objects; at least one object per request) and
+--                 reports done = false with `cursor`: the child index at each depth of the next object to hash. The
+--                 next request passes it back with the hash and object count so far (resume) and continues exactly
+--                 there, so the parts give the hash of one uninterrupted walk.
+local PATCH_FP_SKIP ={ DmxAddresses = true, UIChannels = true, RTChannels = true, FixtureTypesOverview = true, PatchFilter = true }
 local PATCH_FP_SKIP_CLASS = { SubfixtureOverview = true }
 local PATCH_FP_SHALLOW = { DmxUniverses = true }
 local PATCH_FP_RENUMBERED = { DmxCurves = true }
@@ -4297,8 +4626,15 @@ local function patchFingerprint(p, only, exclude, opts)
   opts = opts or {}
   local excludeGuids = opts.excludeGuids or {}
   local excludeTypes = opts.excludeTypes
-  local r = { objects = 0, hash = 2166136261, complete = true }
+  local resume = opts.resume
+  local r = { objects = resume and resume.objects or 0, hash = resume and resume.hash or 2166136261, complete = true, done = true }
   local names = {}
+  -- The budget of this request: path[d] is the child index being hashed at depth d, so a stop can say where to go on.
+  local started, hashed, path = now(), 0, {}
+  local function overBudget()
+    if hashed == 0 then return false end
+    return (opts.maxObjects ~= nil and hashed >= opts.maxObjects) or (opts.budgetMs ~= nil and (now() - started) * 1000 >= opts.budgetMs)
+  end
   local function guidOf(h) local ok, g = pcall(function() return h:Get("Guid", Enums.Roles.Display) end); return ok and g ~= nil and tostring(g) or "" end
   -- (A table with Get is accepted too: the harness's mock objects. On the console a handle is userdata.)
   local function typeIdentity(h)
@@ -4312,6 +4648,19 @@ local function patchFingerprint(p, only, exclude, opts)
     local okP, t = pcall(function() return m:Parent():Parent() end)
     if not (okP and isHandle(t)) then return nil end
     return guidOf(t) .. "/" .. tostring(safeProp(m, "name"))
+  end
+  -- onPC 2.5.1.1 (RoyX4, 2026-10-30): a Fixture's raw FIXTURE handle is the fixture itself, while its Display text can
+  -- name the next sibling (empty on the last one), so adding a fixture changes that text on an untouched neighbour.
+  -- Only a proven raw self-reference (same address and a non-empty GUID) is compared as self#GUID; anything else keeps
+  -- the Display comparison, and a changed GUID still shows.
+  local function fixtureSelfIdentity(h)
+    local ok, f = pcall(function() return h:Get("FIXTURE") end)
+    if not (ok and (isHandle(f) or (type(f) == "table" and type(f.Get) == "function"))) then return nil end
+    local address = safeCall(h, "Addr")
+    if address == nil or address == "" or safeCall(f, "Addr") ~= address then return nil end
+    local g = guidOf(h)
+    if g == "" or guidOf(f) ~= g then return nil end
+    return "self#" .. g
   end
   local function add(h, depth, renumbered, isType, bare)
     if r.objects >= PATCH_FP_LIMIT then r.complete = false; r.reason = "more than " .. PATCH_FP_LIMIT .. " objects"; return false end
@@ -4329,7 +4678,8 @@ local function patchFingerprint(p, only, exclude, opts)
     local parts = { tostring(depth), class, unnumbered and "" or tostring(safeProp(h, "no")) }
     for _, k in ipairs(pn) do
       if not PATCH_FP_PROP_SKIP[k] and not (unnumbered and k == "INDEX") and not (bare and k == "NAME") then
-        local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h)) or ((isType and k == "NAME") and tostring(safeProp(h, "name"))) or nil
+        local v = (k == "FIXTURETYPE" and typeIdentity(h)) or (k == "MODEDIRECT" and modeIdentity(h))
+          or (k == "FIXTURE" and class == "Fixture" and fixtureSelfIdentity(h)) or ((isType and k == "NAME") and tostring(safeProp(h, "name"))) or nil
         if v == nil then
           local okv, dv = pcall(function() return h:Get(k, Enums.Roles.Display) end)
           if not okv then r.complete = false; r.reason = "property " .. tostring(k) .. " of " .. tostring(safeProp(h, "name")) .. " could not be read"; return false end
@@ -4339,6 +4689,7 @@ local function patchFingerprint(p, only, exclude, opts)
       end
     end
     r.objects = r.objects + 1
+    hashed = hashed + 1
     r.hash = fnv(r.hash, table.concat(parts, "\31") .. "\n")
     return true
   end
@@ -4348,13 +4699,19 @@ local function patchFingerprint(p, only, exclude, opts)
     return (name == "Min" and inV == "000000" and outV == "000000") or (name == "Max" and inV == "FFFFFF" and outV == "FFFFFF")
   end
   -- stageList: h is the Stages collection (its children are the stages, for excludeStages / bareStages).
-  local function walk(h, depth, renumbered, guide, typeList, append, defaultCurve, stageList)
+  -- rpath: the resume cursor, followed down from the collection. At its depth the walk starts at the child it names;
+  -- above that depth the named child was hashed in an earlier request and the walk goes on inside it. shallow: only
+  -- the collection's own children (the universes, whose per-address children are left out).
+  local function walk(h, depth, renumbered, guide, typeList, append, defaultCurve, stageList, shallow, rpath)
     local kids = h:Children()
     local gkids = guide and guide:Children() or nil
     -- Truncate to the guide only where an import appends; elsewhere every child is hashed (so an extra one differs).
     local n = (gkids and append and append[depth]) and math.min(#kids, #gkids) or #kids
-    for i = 1, n do
-      if not r.complete then return end
+    local from = rpath and rpath[depth] or 1
+    for i = from, n do
+      if not r.complete or not r.done then return end
+      path[depth] = i
+      local inside = rpath ~= nil and i == from and #rpath > depth
       local c = kids[i]
       local class = safeCall(c, "GetClass")
       local fid = class == "Fixture" and numericFid(c) or nil
@@ -4362,23 +4719,23 @@ local function patchFingerprint(p, only, exclude, opts)
       local skipPoint = defaultCurve and class == "DmxCurvePoint" and defaultEndPoint(c)
       local skipStage = stageList and opts.excludeStages and opts.excludeStages[i]
       if not (fid and exclude[fid]) and not PATCH_FP_SKIP_CLASS[class] and not skipType and not skipPoint and not skipStage then
-        if not add(c, depth, renumbered, typeList, stageList and opts.bareStages and opts.bareStages[i]) then return end
-        walk(c, depth + 1, renumbered, gkids and gkids[i] or nil, false, append, renumbered and depth == 1 and i == 1)
+        if not inside then
+          if overBudget() then r.done = false; r.cursor = { table.unpack(path, 1, depth) }; return end
+          if not add(c, depth, renumbered, typeList, stageList and opts.bareStages and opts.bareStages[i]) then return end
+        end
+        if not shallow then walk(c, depth + 1, renumbered, gkids and gkids[i] or nil, false, append, renumbered and depth == 1 and i == 1, false, false, inside and rpath or nil) end
       end
     end
   end
   for _, c in ipairs(p:Children()) do
-    if not r.complete then break end
+    if not r.complete or not r.done then break end
     local cname = tostring(safeProp(c, "name"))
-    if (only == nil or cname == only) and not PATCH_FP_SKIP[cname] and add(c, 0) then
-      if PATCH_FP_SHALLOW[cname] then
-        for _, u in ipairs(c:Children()) do if not add(u, 1) then break end end
-      else
-        local append = opts.guide and PATCH_FP_APPEND[cname] or nil
-        local guide = append and opts.guide[cname] or nil
-        if append and not guide then r.complete = false; r.reason = "the guide has no collection " .. cname; break end
-        walk(c, 1, PATCH_FP_RENUMBERED[cname], guide, cname == "FixtureTypes", append, nil, cname == "Stages")
-      end
+    -- A resumed walk hashed the collection itself in its first request.
+    if (only == nil or cname == only) and not PATCH_FP_SKIP[cname] and (resume ~= nil or add(c, 0)) then
+      local append = opts.guide and PATCH_FP_APPEND[cname] or nil
+      local guide = append and opts.guide[cname] or nil
+      if append and not guide then r.complete = false; r.reason = "the guide has no collection " .. cname; break end
+      walk(c, 1, PATCH_FP_RENUMBERED[cname], guide, cname == "FixtureTypes", append, nil, cname == "Stages", PATCH_FP_SHALLOW[cname], resume and resume.cursor)
     end
   end
   return r
@@ -4394,7 +4751,12 @@ end
 -- args: { side = "live" | "copy", collection = <name>, excludeFids = [ ... ],
 --         excludeGuids = [ type GUID, ... ], excludeTypes = [ { index, guid }, ... ], prefixOfLive = true (copy side only: hash only what the live patch
 --         has in every container, leaving out what an import appended), fixturePositions = false (a move, 0.42.0),
---         excludeStages = [ position, ... ], bareStages = [ position, ... ] (a stage session, 0.48.0) }
+--         excludeStages = [ position, ... ], bareStages = [ position, ... ] (a stage session, 0.48.0),
+--         budgetMs = <ms>, maxObjects = <n> (stop after that much work), resume = <the resume object
+--         of the previous reply> }
+-- The reply has done = false and `resume` while the collection is not finished: the client sends the same request
+-- with that resume object until done is true; objects and hash are then the whole collection's. Without budgetMs and
+-- maxObjects the whole collection is hashed in one request, as before.
 ops["patch.fingerprint"] = function(args)
   if type(args.collection) ~= "string" then raise("[bad-args] collection (string) is required; patch.collections lists them") end
   local exclude = {}
@@ -4419,6 +4781,17 @@ ops["patch.fingerprint"] = function(args)
       end
     end
   end
+  if args.budgetMs ~= nil then opts.budgetMs = integerArg(args.budgetMs, "budgetMs", 1, 60000) end
+  if args.maxObjects ~= nil then opts.maxObjects = integerArg(args.maxObjects, "maxObjects", 1, PATCH_FP_LIMIT) end
+  if args.resume ~= nil then
+    -- The hash travels as hex text, so no JSON number formatting can change it on the way.
+    local rs = args.resume
+    local bad = "[bad-args] resume must be the resume object of the previous patch.fingerprint reply"
+    if type(rs) ~= "table" or type(rs.cursor) ~= "table" or #rs.cursor == 0 or type(rs.hash) ~= "string" or not rs.hash:match("^%x+$") then raise(bad) end
+    local cursor = {}
+    for i, x in ipairs(rs.cursor) do cursor[i] = math.tointeger(integerArg(x, "resume.cursor[]", 1, PATCH_FP_LIMIT)) end
+    opts.resume = { cursor = cursor, hash = tonumber(rs.hash, 16), objects = math.tointeger(integerArg(rs.objects, "resume.objects", 0, PATCH_FP_LIMIT)) }
+  end
   local p = patchSide(args.side or "live")
   if args.prefixOfLive == true then
     if args.side ~= "copy" then raise("[bad-args] prefixOfLive applies to the copy side only") end
@@ -4426,6 +4799,8 @@ ops["patch.fingerprint"] = function(args)
   end
   local started = now()
   local fp = patchFingerprint(p, args.collection, exclude, opts)
+  if not fp.done then fp.resume = { cursor = fp.cursor, hash = string.format("%08x", fp.hash), objects = fp.objects } end
+  fp.cursor = nil
   fp.collection = args.collection
   fp.side = args.side or "live"
   fp.ms = math.floor((now() - started) * 1000 + 0.5)
@@ -5021,12 +5396,65 @@ do
     end
   end
 
-  -- args: { file }. Read-only: the user-library file's size and CRC-32, and every library that lists the name.
+  -- #143 (bridge 0.57.0): kind "image" puts a .png / .jpg into gma3_library/media/images, the folder
+  -- Import Image 3.<n> /File "<file>" reads (probe on onPC 2.5.1.1, 2026-11-17). 10 MiB: the Images pool's limit per object
+  -- (POOLOBJECTCONTENTSIZELIMITATION 10485760).
+  local IMAGE_ADD_MAX_BYTES = 10 * 1024 * 1024
+  local function imageFileName(file)
+    if type(file) ~= "string" or file == "" then raise("[bad-args] file is required: <name>.png, .jpg or .jpeg") end
+    if #file > 128 then raise("[bad-name] the file name is longer than 128 characters") end
+    if file:find("[<>:\"/\\|%?%*%c]") or file:sub(1, 1) == "." or file:find("..", 1, true) then raise("[bad-name] the file name must not contain < > : \" / \\ | ? * .. or a control character, nor start with a dot") end
+    local ext = file:match("%.(%w+)$")
+    if ext ~= "png" and ext ~= "jpg" and ext ~= "jpeg" then raise("[bad-name] the file name must end in .png, .jpg or .jpeg (lower case)") end
+    return ext
+  end
+  -- gma3_library/media/images, next to the user fixture library (gma3_library/fixturetypes, SU-03); PathType UserImages
+  -- only when that folder is not the usual one (the path type's folder is unverified).
+  local function imageLibrary()
+    local ok, fx = pcall(userLibrary)
+    local root = ok and type(fx) == "string" and fx:match("^(.*)[/\\]fixturetypes[/\\]?$") or nil
+    if root then return root .. "/media/images", "derived" end
+    local pt = Enums.PathType and Enums.PathType.UserImages
+    if pt ~= nil then
+      local okP, pth = pcall(GetPath, pt)
+      if okP and type(pth) == "string" and pth ~= "" then return pth, "UserImages" end
+    end
+    raise("[no-library] the images folder (gma3_library/media/images) cannot be found")
+  end
+  -- Files in the images folder equal to this name ignoring case (one file on macOS and Windows).
+  local function imageSameName(base, file)
+    local ok, list = pcall(DirList, base, "*")
+    if not ok or type(list) ~= "table" then raise({ code = "scan-incomplete", message = "the images folder " .. base .. " cannot be listed, so a file of the same name cannot be ruled out; nothing was written" }) end
+    local out, want = {}, file:lower()
+    for _, e in ipairs(list) do
+      if type(e.name) == "string" and e.name:lower() == want then out[#out + 1] = { source = "images", file = e.name } end
+    end
+    return out
+  end
+  -- What an upload writes: its folder, size limit and extension, by kind (default fixture).
+  local function uploadTarget(args)
+    if args.kind == nil or args.kind == "fixture" then
+      local ext = libraryFileName(args.file)
+      return { kind = "fixture", ext = ext, base = userLibrary(), max = LIB_ADD_MAX_BYTES }
+    elseif args.kind == "image" then
+      local ext = imageFileName(args.file)
+      local base, how = imageLibrary()
+      return { kind = "image", ext = ext, base = base, how = how, max = IMAGE_ADD_MAX_BYTES }
+    end
+    raise("[bad-args] kind must be fixture or image")
+  end
+
+  -- args: { file, kind? }. Read-only: the user-library (or images-folder) file's size and CRC-32, and every library that lists the name.
   ops["patch.libraryStat"] = function(args)
-    libraryFileName(args.file)
-    local base = userLibrary()
-    local path = base .. "/" .. args.file
+    local tgt = uploadTarget(args)
+    local path = tgt.base .. "/" .. args.file
     local size, crc = fileCrc(path)
+    if tgt.kind == "image" then
+      local matches = imageSameName(tgt.base, args.file)
+      local listed = {}
+      for _, m in ipairs(matches) do if m.file == args.file then listed[#listed + 1] = m.source end end
+      return { file = args.file, kind = "image", path = path, folder = tgt.base, folderFrom = tgt.how, exists = size ~= nil, size = size, crc32 = crc, listedIn = emptyArray(listed), matches = emptyArray(matches), maxBytes = tgt.max }
+    end
     local listed, matches = {}, sameName(args.file)
     for _, m in ipairs(matches) do if m.file == args.file then listed[#listed + 1] = m.source end end
     -- listedIn: the libraries with exactly this name; matches: every entry equal ignoring case.
@@ -5062,10 +5490,11 @@ do
   -- every chunk must start where the part file ends. The final chunk checks total and crc32 against the part file and
   -- the libraries again, then moves it into place. abort removes the upload's part file.
   ops["patch.libraryAdd"] = function(args)
-    local ext = libraryFileName(args.file)
+    local tgt = uploadTarget(args)
+    local ext = tgt.ext
     if type(args.upload) ~= "string" or not args.upload:match("^%x+$") or #args.upload ~= 16 then raise("[bad-args] upload must be an id of 16 hex digits") end
     local id = args.upload:lower()
-    local base = userLibrary()
+    local base = tgt.base
     local path = base .. "/" .. args.file
     local part = path .. "." .. id .. PART_SUFFIX
     local now = os.time()
@@ -5075,8 +5504,8 @@ do
       uploads[id] = nil
       return { aborted = true, removed = had, partLeft = fileSize(part) ~= nil }
     end
-    local total = integerArg(args.total, "total", 1, LIB_ADD_MAX_BYTES)
-    local offset = integerArg(args.offset, "offset", 0, LIB_ADD_MAX_BYTES)
+    local total = integerArg(args.total, "total", 1, tgt.max)
+    local offset = integerArg(args.offset, "offset", 0, tgt.max)
     if type(args.crc32) ~= "string" or not args.crc32:match("^%x%x%x%x%x%x%x%x$") then raise("[bad-args] crc32 must be 8 hex digits") end
     if type(args.data) ~= "string" then raise("[bad-args] data (base64) is required") end
     if #args.data > LIB_ADD_MAX_CHUNK * 4 // 3 + 4 then raise("[bad-args] a chunk is at most " .. LIB_ADD_MAX_CHUNK .. " bytes") end
@@ -5084,9 +5513,14 @@ do
     if bytes == nil then raise("[bad-args] data is not valid base64") end
     local function fail(err) os.remove(part); uploads[id] = nil; raise(err) end
     local exists = fileSize(path) ~= nil
-    if exists and args.replace ~= true then fail("[exists] " .. args.file .. " is already in the user library; pass replace to overwrite it") end
+    if exists and args.replace ~= true then fail("[exists] " .. args.file .. " is already in the " .. (tgt.kind == "image" and "images folder" or "user library") .. "; pass replace to overwrite it") end
     -- The library scan (about 11 500 grandMA2 entries) runs at the start and before the move only, not per chunk.
-    if offset == 0 or args.final == true then
+    if (offset == 0 or args.final == true) and tgt.kind == "image" then
+      for _, m in ipairs(imageSameName(base, args.file)) do
+        if m.file ~= args.file then fail({ code = "ambiguous-file", message = args.file .. " differs only in case from " .. m.file .. " in the images folder (one file on macOS and Windows)", sources = { "images" }, collidesWith = m.file }) end
+      end
+    end
+    if (offset == 0 or args.final == true) and tgt.kind == "fixture" then
       local other = otherLibrary(args.file)
       if other then
         fail({ code = "ambiguous-file", message = (other.file == args.file and (args.file .. " is already in the " .. other.source .. " library") or (args.file .. " differs only in case from " .. other.file .. " in the " .. other.source .. " library (one file on macOS and Windows)")) .. "; Import Library could not tell the two apart", sources = { other.source }, collidesWith = other.file })
@@ -5135,8 +5569,244 @@ do
       if key:sub(1, #path + 1) == path .. "|" then headerCache[key] = nil end
     end
     local finalSize, finalCrc = fileCrc(path)
-    return { file = args.file, path = path, format = ext, size = finalSize, crc32 = finalCrc, replaced = exists }
+    return { file = args.file, kind = tgt.kind, path = path, format = ext, size = finalSize, crc32 = finalCrc, replaced = exists }
   end
+  end)()
+
+  -- #143 (bridge 0.57.0): Bitmaps (DataPool.GeneratorTypes.Bitmaps) and the Images pool (ShowData.MediaPools.Images,
+  -- image pool 3). Probe on onPC 2.5.1.1 (2026-11-17): Store Bitmap <n> creates class Bitmap with BitmapConfigs
+  -- (BitmapConfig 1: Content handle, Width, Height, ContentMode, Interpolate, Alpha, Control*) and BitmapChannels (five
+  -- defaults: Dimmer<-Intensity, Dimmer<-Const, ColorRGB_R/G/B<-Red/Green/Blue); Set('Content', <UserImage>), Set('Width'),
+  -- Set('Height') and Set('ContentMode') read back as set. Replacing channels (Acquire / Delete) is unverified.
+  ;(function()
+  local function handleLike(v) return isHandle(v) or (type(v) == "table" and type(v.Get) == "function") end
+  local function numberOf(c)
+    local n = tonumber(safeProp(c, "no"))
+    if n then return n end
+    local d = displayProp(c, "No")
+    return d and tonumber(d:match("^%s*(%d+)")) or nil
+  end
+  local function rawGet(o, k)
+    local ok, v = pcall(function() return o:Get(k) end)
+    if ok then return v end
+    return nil
+  end
+  local function child(o, name, class)
+    local v = safeProp(o, name)
+    if handleLike(v) then return v end
+    for _, c in ipairs(o:Children()) do if safeCall(c, "GetClass") == class then return c end end
+    return nil
+  end
+  local function findNo(pool, no)
+    for _, c in ipairs(pool:Children()) do if numberOf(c) == no then return c end end
+    return nil
+  end
+  local function bitmapsPool()
+    local gt = safeProp(DataPool(), "GeneratorTypes")
+    local p = gt and child(gt, "Bitmaps", "Bitmaps")
+    if not p then raise("[no-pool] DataPool.GeneratorTypes.Bitmaps cannot be read") end
+    return p
+  end
+  local function imagesPool()
+    local mp = safeProp(ShowData(), "MediaPools")
+    local p = mp and child(mp, "Images", "Images")
+    if not p then raise("[no-pool] ShowData.MediaPools.Images cannot be read") end
+    return p
+  end
+  local function num(o, k)
+    local v = rawGet(o, k)
+    if type(v) == "number" then return v end
+    local d = displayProp(o, k)
+    return d and tonumber(d:match("^%s*(%-?[%d%.]+)")) or nil
+  end
+  local function imageEntry(img)
+    local no = numberOf(img)
+    return { no = no, ref = no and ("3." .. no) or nil, name = tostring(safeProp(img, "name") or ""), class = safeCall(img, "GetClass"),
+      fileName = displayProp(img, "FileName"), fileSize = displayProp(img, "FileSize"), width = num(img, "Width"), height = num(img, "Height") }
+  end
+  local function contentRef(h)
+    if not handleLike(h) then return nil end
+    local no = numberOf(h)
+    local cls = safeCall(h, "GetClass")
+    return { class = cls, name = safeProp(h, "name"), no = no, ref = (cls == "UserImage" and no) and ("3." .. no) or nil }
+  end
+  local CONFIG_TEXT = { "ContentMode", "Interpolate", "Alpha" }
+  local CONFIG_NUM = { "Width", "Height", "ControlX", "ControlY", "ControlZoom", "ControlAspect", "ControlRotate" }
+  local function configEntry(cfg, i)
+    local e = { index = i, content = contentRef(rawGet(cfg, "Content")) }
+    for _, k in ipairs(CONFIG_NUM) do e[k:sub(1, 1):lower() .. k:sub(2)] = num(cfg, k) end
+    for _, k in ipairs(CONFIG_TEXT) do e[k:sub(1, 1):lower() .. k:sub(2)] = displayProp(cfg, k) end
+    return e
+  end
+  local function channelEntry(c, i)
+    local a = rawGet(c, "Attribute")
+    return { index = i, attribute = handleLike(a) and safeProp(a, "name") or nil, source = displayProp(c, "Source"), low = num(c, "ValueLow"), high = num(c, "ValueHigh") }
+  end
+  local function bitmapEntry(b)
+    local configs, channels = {}, {}
+    local cf = child(b, "BitmapConfigs", "BitmapConfigs")
+    local ch = child(b, "BitmapChannels", "BitmapChannels")
+    if cf then for i, c in ipairs(cf:Children()) do configs[#configs + 1] = configEntry(c, i) end end
+    if ch then for i, c in ipairs(ch:Children()) do channels[#channels + 1] = channelEntry(c, i) end end
+    return { no = numberOf(b), name = tostring(safeProp(b, "name") or ""), class = safeCall(b, "GetClass"), speedMaster = displayProp(b, "SpeedMaster"),
+      configs = emptyArray(configs), channels = emptyArray(channels) }
+  end
+
+  -- args: { bitmap?, image?, images? }. Read-only. bitmap / image: that slot (found false when empty); without bitmap every
+  -- bitmap; images: true lists the Images pool too.
+  ops["bitmap.list"] = function(args)
+    local out = {}
+    local bp = bitmapsPool()
+    if args.bitmap ~= nil then
+      local no = integerArg(args.bitmap, "bitmap", 1, 9999)
+      local b = findNo(bp, no)
+      out.bitmapFound = b ~= nil
+      if b then out.bitmap = bitmapEntry(b) end
+    else
+      local all = {}
+      for _, b in ipairs(bp:Children()) do all[#all + 1] = bitmapEntry(b) end
+      out.bitmaps = emptyArray(all)
+    end
+    if args.image ~= nil or args.images == true then
+      local ip = imagesPool()
+      if args.image ~= nil then
+        local img = findNo(ip, integerArg(args.image, "image", 1, 9999))
+        out.imageFound = img ~= nil
+        if img then out.image = imageEntry(img) end
+      end
+      if args.images == true then
+        local all = {}
+        for _, img in ipairs(ip:Children()) do all[#all + 1] = imageEntry(img) end
+        out.images = emptyArray(all)
+      end
+    end
+    return out
+  end
+
+  -- args: { image, name }. The image's name (Import Image names it "[<file>_png]").
+  ops["bitmap.imageName"] = function(args)
+    local name = nameArg(args.name, "name")
+    if name == nil then raise("[bad-args] name is required") end
+    local img = findNo(imagesPool(), integerArg(args.image, "image", 1, 9999))
+    if not img then raise("[no-image] no image 3." .. tostring(args.image)) end
+    local ok, err = pcall(function() img:Set("Name", name) end)
+    return { image = imageEntry(img), setError = (not ok) and tostring(err) or nil }
+  end
+
+  local function findAttribute(name)
+    local lp = ShowData().LivePatch
+    local defs = lp and safeProp(lp, "AttributeDefinitions")
+    local attrs = defs and safeProp(defs, "Attributes")
+    if not handleLike(attrs) then raise("[no-attributes] the show's attribute definitions cannot be read") end
+    local want = name:lower()
+    for _, a in ipairs(attrs:Children()) do
+      local n = safeProp(a, "name")
+      if type(n) == "string" and n:lower() == want then return a, n end
+    end
+    return nil
+  end
+  local SOURCES = { intensity = true, const = true, red = true, green = true, blue = true, alpha = true, hue = true, saturation = true, brightness = true }
+
+  -- args: { bitmap, name?, speedMaster?, config = { image?, width?, height?, contentMode?, interpolate?, alpha?, controlX?,
+  -- controlY?, controlZoom?, controlAspect?, controlRotate? }, channels? = [{ attribute, source, low?, high? }] }.
+  -- Everything is checked before anything is set; each Set runs on its own and a refusal is reported in setErrors.
+  -- Returns the bitmap as it reads afterwards.
+  ops["bitmap.set"] = function(args)
+    local no = integerArg(args.bitmap, "bitmap", 1, 9999)
+    local b = findNo(bitmapsPool(), no)
+    if not b then raise("[no-bitmap] no bitmap " .. no .. "; store it first") end
+    local name = nameArg(args.name, "name")
+    local cfgArgs = type(args.config) == "table" and args.config or {}
+    local cf = child(b, "BitmapConfigs", "BitmapConfigs")
+    local cfg = cf and cf:Children()[1]
+    if not cfg then raise("[no-config] bitmap " .. no .. " has no BitmapConfig 1") end
+    local img
+    if cfgArgs.image ~= nil then
+      img = findNo(imagesPool(), integerArg(cfgArgs.image, "config.image", 1, 9999))
+      if not img then raise("[no-image] no image 3." .. tostring(cfgArgs.image)) end
+    end
+    local sets = {}
+    for _, k in ipairs(CONFIG_NUM) do
+      local key = k:sub(1, 1):lower() .. k:sub(2)
+      local v = cfgArgs[key]
+      if v ~= nil then
+        if type(v) ~= "number" then raise("[bad-args] config." .. key .. " must be a number") end
+        sets[#sets + 1] = { field = "config." .. key, obj = cfg, prop = k, value = tostring(v) }
+      end
+    end
+    for _, k in ipairs(CONFIG_TEXT) do
+      local key = k:sub(1, 1):lower() .. k:sub(2)
+      local v = cfgArgs[key]
+      if v ~= nil then
+        if type(v) == "boolean" then v = v and "Yes" or "No" end
+        if type(v) ~= "string" or v == "" or v:find("[%c\"]") then raise("[bad-args] config." .. key .. " must be a word") end
+        sets[#sets + 1] = { field = "config." .. key, obj = cfg, prop = k, value = v }
+      end
+    end
+    local chans
+    if args.channels ~= nil then
+      if type(args.channels) ~= "table" or #args.channels == 0 or #args.channels > 32 then raise("[bad-args] channels must be a list of 1 to 32 channels") end
+      chans = {}
+      for i, c in ipairs(args.channels) do
+        if type(c) ~= "table" or type(c.attribute) ~= "string" or c.attribute == "" then raise("[bad-args] channels[" .. i .. "].attribute is required") end
+        local a, aname = findAttribute(c.attribute)
+        if not a then raise({ code = "no-attribute", message = "channels[" .. i .. "]: the show has no attribute " .. c.attribute, attribute = c.attribute }) end
+        if type(c.source) ~= "string" or not SOURCES[c.source:lower()] then raise("[bad-args] channels[" .. i .. "].source must be one of Intensity, Const, Red, Green, Blue, Alpha, Hue, Saturation, Brightness") end
+        for _, k in ipairs({ "low", "high" }) do
+          if c[k] ~= nil and (type(c[k]) ~= "number" or c[k] < -100000 or c[k] > 100000) then raise("[bad-args] channels[" .. i .. "]." .. k .. " must be a number") end
+        end
+        chans[i] = { attr = a, attrName = aname, source = c.source, low = c.low, high = c.high }
+      end
+    end
+    if args.speedMaster ~= nil and (type(args.speedMaster) ~= "string" or args.speedMaster:find("[%c\"]")) then raise("[bad-args] speedMaster must be text") end
+
+    local errs = {}
+    local function try(field, f)
+      local ok, err = pcall(f)
+      if not ok then errs[#errs + 1] = { field = field, error = tostring(err) } end
+    end
+    if name then try("name", function() b:Set("Name", name) end) end
+    if args.speedMaster ~= nil then try("speedMaster", function() b:Set("SpeedMaster", args.speedMaster) end) end
+    if img then try("config.image", function() cfg:Set("Content", img) end) end
+    for _, s in ipairs(sets) do try(s.field, function() s.obj:Set(s.prop, s.value) end) end
+    if chans then
+      local holder = child(b, "BitmapChannels", "BitmapChannels")
+      if not holder then
+        errs[#errs + 1] = { field = "channels", error = "bitmap " .. no .. " has no BitmapChannels" }
+      else
+        -- Grow first (Acquire appends a channel), then drop the extra ones from the end.
+        local guard = 0
+        while holder:Count() < #chans and guard < 40 do
+          guard = guard + 1
+          local ok, err = pcall(function() return holder:Acquire("BitmapChannel") end)
+          if not ok then errs[#errs + 1] = { field = "channels", error = "a channel could not be added: " .. tostring(err) }; break end
+        end
+        for j = holder:Count(), #chans + 1, -1 do
+          local ok, err = pcall(function() holder:Delete(j) end)
+          if not ok then errs[#errs + 1] = { field = "channels", error = "channel " .. j .. " could not be removed: " .. tostring(err) }; break end
+        end
+        local kids = holder:Children()
+        for i, c in ipairs(chans) do
+          local h = kids[i]
+          if not h then errs[#errs + 1] = { field = "channels[" .. i .. "]", error = "the channel is missing" }
+          else
+            try("channels[" .. i .. "].attribute", function()
+              local ok = pcall(function() h:Set("Attribute", c.attr) end)
+              local now = rawGet(h, "Attribute")
+              if not ok or not handleLike(now) or safeProp(now, "name") ~= c.attrName then h:Set("Attribute", c.attrName) end
+            end)
+            try("channels[" .. i .. "].source", function() h:Set("Source", c.source) end)
+            if c.low ~= nil then try("channels[" .. i .. "].low", function() h:Set("ValueLow", tostring(c.low)) end) end
+            if c.high ~= nil then try("channels[" .. i .. "].high", function() h:Set("ValueHigh", tostring(c.high)) end) end
+          end
+        end
+      end
+    end
+    return { bitmap = bitmapEntry(b), setErrors = emptyArray(errs) }
+  end
+  -- Show-object writes: refused while another client owns input, like cmd and set (the uploads only write files).
+  GUARDED_OPS["bitmap.set"] = "a bitmap change"
+  GUARDED_OPS["bitmap.imageName"] = "an image rename"
   end)()
 
   local function typeRow(t)
@@ -6364,6 +7034,8 @@ GUARDED_OPS["tags.protect"] = "a tag protection change"
 --                 thread would stall the bridge, so the command lands on a later frame and the server polls
 --   show.answer   clicks OK or Cancel on one of SaveShow's own dialogs, only when the top modal's title is the one the
 --                 server expects ("Change show file name?" / "... and overwrite existing show file?")
+--   show.load     (0.54.0) queues LoadShow "name" with CmdIndirect for a file in the shows folder; the load unloads
+--                 this bridge, so the server restarts it and judges the result from the new bridge's answers
 -- Live (onPC 2.5.1): SaveShow under the current name writes with no dialog; a new name asks "Change show file name?";
 -- an existing other file asks "Change show file name and overwrite existing show file?". OK writes at once.
 -------------------------------------------------------------------------------
@@ -6505,6 +7177,30 @@ GUARDED_OPS["tags.protect"] = "a tag protection change"
     Mouse(md.display, "release", "Left")
     return { clicked = args.button, title = md.title, display = md.display }
   end
+
+  -- 0.54.0 (from silly82): args: { name, exclusive }. Queues LoadShow "name" with CmdIndirect, only for a .show file that is in the
+  -- shows folder. Loading unloads the show's plugins, this bridge included (live, onPC 2.5.1): the answer to this
+  -- request is the last one. A show with unsaved changes first asks "Warning" / "Show file '<current>' has changed!
+  -- Do you want to save the old show file first?" (Save / Do not save / Cancel); the server answers it with
+  -- dialog.press before the load goes on.
+  ops["show.load"] = function(args)
+    requireExclusive(args, "show.load")
+    local name = showName(args.name)
+    local open, _, modalError = topModal()
+    if modalError then raise("[modal-unknown] whether a dialog is open cannot be read (" .. modalError .. "); LoadShow was not sent") end
+    if open then raise("[modal-open] a dialog is open on the console; LoadShow was not sent") end
+    local ok, list = pcall(DirList, GetPath(Enums.PathType.Showfiles), "*.show")
+    if not ok or type(list) ~= "table" then raise("[not-listed] the shows folder cannot be listed; LoadShow was not sent") end
+    local file
+    for _, e in ipairs(list) do
+      if type(e) == "table" and type(e.name) == "string" and e.name:gsub("%.show$", ""):lower() == name:lower() then file = e.name:gsub("%.show$", "") break end
+    end
+    if not file then raise("[no-file] " .. name .. ".show is not in the shows folder; LoadShow was not sent") end
+    local command = 'LoadShow "' .. file .. '"'
+    CmdIndirect(command)
+    return { queued = true, command = command, from = currentShow(), now = os.time() }
+  end
+  GUARDED_OPS["show.load"] = "a show load"
 end)()
 
 -------------------------------------------------------------------------------
@@ -6632,6 +7328,99 @@ end)()
     return { clicked = args.button, title = md.title, text = md.text, class = md.class, display = md.display, at = at }
   end
   GUARDED_OPS["dialog.press"] = "a dialog answer"
+
+  ---------------------------------------------------------------------------
+  -- Edit Recipe mode (phaser recipes, bridge 0.52.0)
+  ---------------------------------------------------------------------------
+  -- recipe.editState  read-only: whether the operator's Edit Recipe mode is on (RecipeEditor.RecipeEditing of the
+  --                   current environment), the recipe lines in the programmer's Part Zero, the top modal and the
+  --                   console's last command
+  -- recipe.editBegin  queues `EditRecipe <target>` with CmdIndirect after checking that no dialog is open, the mode is
+  --                   off and Part Zero holds no recipe line
+  -- recipe.editEnd    queues `EditRecipe` (the toggle) with CmdIndirect, only while the mode is on and no dialog is open
+  -- Console facts (onPC 2.5.1, live 2026-11-14, THK migration docs/phaser-recipes.md §1.7): a store made in Edit
+  -- Recipe mode leaves its target pending; the next `EditRecipe <other target>` opens "Update last object?" (OK
+  -- updates the pending target with the programmer, an empty programmer wipes its recipe lines; Cancel aborts the
+  -- EditRecipe). Sent with Cmd() from the plugin thread, that dialog stalls the bridge, so the command is queued
+  -- and the server polls recipe.editState. A normal store with an empty programmer (the target's own empty Store)
+  -- clears the pending target.
+  local function recipeEditor()
+    local okE, env = pcall(CurrentEnvironment)
+    if not okE or env == nil then raise("[no-environment] the current user environment cannot be read") end
+    local okR, re = pcall(function() return env.RecipeEditor end)
+    if not okR or re == nil then raise("[no-recipe-editor] the environment " .. tostring(safeProp(env, "name")) .. " has no RecipeEditor") end
+    return env, re
+  end
+  local function truthy(v)
+    if v == true or v == 1 then return true end
+    if v == false or v == 0 or v == nil then return false end
+    local s = tostring(v):lower()
+    return s == "yes" or s == "on" or s == "true" or s == "1"
+  end
+  local function partZero()
+    local okP, prog = pcall(Programmer)
+    if not okP or prog == nil then raise("[no-programmer] the programmer cannot be read") end
+    for _, c in ipairs(prog:Children() or {}) do
+      if tostring(safeProp(c, "name")) == "Part Zero" or tonumber(safeProp(c, "no")) == 0 then return c end
+    end
+    -- No Part Zero (seen live once, the programmer then held 20 phaser values; cause not established): no recipe line.
+    return nil
+  end
+  local function editState()
+    local env, re = recipeEditor()
+    local okG, raw = pcall(function() return re:Get("RecipeEditing") end)
+    if not okG or raw == nil then raw = safeProp(re, "RecipeEditing") end
+    local pz = partZero()
+    local lines = {}
+    for i, c in ipairs(pz and pz:Children() or {}) do lines[#lines + 1] = { index = i, class = safeCall(c, "GetClass"), name = tostring(safeProp(c, "name")) } end
+    local md, _, why = topModal()
+    return {
+      environment = tostring(safeProp(env, "name")),
+      editing = truthy(raw),
+      editingRaw = raw ~= nil and tostring(raw) or nil,
+      partZeroLines = emptyArray(lines),
+      partZero = pz ~= nil,
+      modal = md or false,
+      modalError = why,
+      lastCommand = lastCommand(),
+    }
+  end
+  -- The target forms the server sends; anything else is refused (the text goes into a command line).
+  local function recipeTarget(ref)
+    if type(ref) ~= "string" then raise("[bad-args] target must be a string") end
+    if ref:match("^Preset %d+%.%d+$") or ref:match("^Sequence %d+ Cue %d+%.?%d* Part %d+$") then return ref end
+    raise("[bad-args] target must read \"Preset P.N\" or \"Sequence S Cue C Part P\", not " .. ref)
+  end
+
+  ops["recipe.editState"] = function() return editState() end
+
+  -- args: { target, exclusive }
+  ops["recipe.editBegin"] = function(args)
+    if args.exclusive ~= true then raise("[not-exclusive] recipe.editBegin needs exclusive = true: the client confirms that nobody else uses the programmer while it builds a recipe") end
+    local ref = recipeTarget(args.target)
+    local before = editState()
+    if before.modalError then raise("[modal-unknown] whether a dialog is open cannot be read (" .. before.modalError .. "); EditRecipe was not sent") end
+    if before.modal then raise({ code = "modal-open", message = "a dialog is open (" .. tostring(before.modal.title) .. "); EditRecipe was not sent", modal = before.modal }) end
+    if before.editing then raise("[editing-on] the Edit Recipe mode is already on; EditRecipe was not sent") end
+    if #before.partZeroLines > 0 then raise({ code = "part-zero-busy", message = "the programmer's Part Zero holds " .. #before.partZeroLines .. " recipe line(s); EditRecipe was not sent", lines = before.partZeroLines }) end
+    local command = "EditRecipe " .. ref
+    CmdIndirect(command)
+    return { queued = true, command = command, before = before }
+  end
+  GUARDED_OPS["recipe.editBegin"] = "an Edit Recipe session"
+
+  -- args: { exclusive } -> queues `EditRecipe` (a toggle) with CmdIndirect, only while the mode reads on and no dialog
+  -- is open, so it can only switch the mode off. Part Zero is left as it is (lines not stored stay; ClearAll removes them).
+  ops["recipe.editEnd"] = function(args)
+    if args.exclusive ~= true then raise("[not-exclusive] recipe.editEnd needs exclusive = true: the client confirms that nobody else uses the programmer") end
+    local before = editState()
+    if before.modalError then raise("[modal-unknown] whether a dialog is open cannot be read (" .. before.modalError .. "); EditRecipe was not sent") end
+    if before.modal then raise({ code = "modal-open", message = "a dialog is open (" .. tostring(before.modal.title) .. "); EditRecipe was not sent", modal = before.modal }) end
+    if not before.editing then raise("[editing-off] the Edit Recipe mode is already off; EditRecipe (a toggle) was not sent") end
+    CmdIndirect("EditRecipe")
+    return { queued = true, command = "EditRecipe", before = before }
+  end
+  GUARDED_OPS["recipe.editEnd"] = "an Edit Recipe session"
 
   ---------------------------------------------------------------------------
   -- Moving fixtures
@@ -7552,6 +8341,8 @@ local function closeClient(i, reason)
   local c = state.clients[i]
   if c then
     releaseClientSession(c, reason or "disconnect")
+    -- 0.55.0: the connection's open undo group is closed with it.
+    if state.undo and state.undo.client == c then pcall(CloseUndo, state.undo.handle); state.undo = nil end
     pcall(function() c.sock:close() end)
   end
   table.remove(state.clients, i)
@@ -8071,6 +8862,13 @@ local function MainImpl(display_handle, argument)
   -- Continuous control (KB-18) is an explicit per-start decision as well; only unresolved releases carry over.
   state.control = { enabled = false, backend = nil, unresolved = state.control.unresolved or {}, spec = nil }
   state.running = true
+  -- 0.53.0 (from silly82): an identity per start, so a client can tell a restarted bridge from the one that was running
+  -- (the state table lives in _G and survives a show load).
+  state.instance = string.format("%d-%d", os.time(), math.random(1, 1073741823))
+  -- 0.55.0: an undo group left open by a run that did not stop cleanly is closed.
+  if state.undo then pcall(CloseUndo, state.undo.handle); state.undo = nil end
+  -- 0.56.0: groups remembered for undo.undo belong to the previous run.
+  state.undoHistory = {}
   state.stopRequested = false
   state.clients = {}
   loadModules()

@@ -4,7 +4,7 @@
  * All four must be absent. Requires a disposable loaded show and a confirmed empty programmer.
  * No assigned macro/sequence is invoked, no selection is changed, and no SaveShow is sent.
  * Run only by the console operator:
- *   GMA3_LIVE=1 node --import tsx --test test/live/layouts.live.ts
+ *   GMA3_LIVE=1 node --import tsx --test test/live/layout-editing.live.ts
  */
 import assert from "node:assert/strict";
 import { z } from "zod";
@@ -12,7 +12,7 @@ import { liveTest, cmd } from "./live.ts";
 import { MutationLock } from "../../src/mutations.ts";
 import type { ToolContext } from "../../src/tools/context.ts";
 import { exists } from "../../src/tools/common.ts";
-import { readLayouts, storeLayout, editLayoutElements } from "../../src/tools/layouts.ts";
+import { readLayoutElements, configureLayout, editLayoutElements } from "../../src/tools/layoutedit.ts";
 
 const POOL = 1;
 const LAYOUT = 909;
@@ -35,16 +35,16 @@ liveTest("General Layout authoring: add/edit/remove with GUID identity, appearan
   assert.equal(await cmd(`Store DataPool ${POOL} Sequence ${SOURCE} Cue 1 /NoConfirmation`), "OK");
   assert.equal(await cmd(`Store Appearance ${SOURCE} /NoConfirmation`), "OK");
   const base = { data_pool: POOL, layout: LAYOUT };
-  const read = async () => layoutSchema.parse(await readLayouts(ctx, base));
-  const assertSuccess = (result: Awaited<ReturnType<typeof storeLayout>>) => {
+  const read = async () => layoutSchema.parse(await readLayoutElements(ctx, base));
+  const assertSuccess = (result: Awaited<ReturnType<typeof configureLayout>>) => {
     assert.equal(result.outcome, "succeeded", JSON.stringify(result));
     assert.equal(result.verification.status, "matched", JSON.stringify(result));
   };
-  const preview = await storeLayout(ctx, { ...base, mode: "create", name: "MCP Layout authoring", preview: true });
+  const preview = await configureLayout(ctx, { ...base, mode: "create", name: "MCP Layout authoring", preview: true });
   assert.equal(preview.outcome, "succeeded");
   assert.equal((await exists(bridge, references[0] ?? "")).exists, false, "preview creates nothing");
-  assertSuccess(await storeLayout(ctx, { ...base, mode: "create", name: "MCP Layout authoring", canvas_x: -200, canvas_y: -100, canvas_width: 600, canvas_height: 400, note: "Disposable layout qualification" }));
-  assert.equal((await storeLayout(ctx, { ...base, mode: "create" })).outcome, "failed", "create cannot overwrite");
+  assertSuccess(await configureLayout(ctx, { ...base, mode: "create", name: "MCP Layout authoring", canvas_x: -200, canvas_y: -100, canvas_width: 600, canvas_height: 400, note: "Disposable layout qualification" }));
+  assert.equal((await configureLayout(ctx, { ...base, mode: "create" })).outcome, "failed", "create cannot overwrite");
   assertSuccess(await editLayoutElements(ctx, { ...base, edits: [
     { operation: "add", x: -120, y: 80, width: 100, height: 50, object: { type: "Macro", number: SOURCE }, action: "Go+", appearance: SOURCE, custom_text: 'Macro "label"  exact', custom_text_color: "11AA33FF", custom_text_size: "14", custom_text_align_h: "Left", custom_text_align_v: "Top", visibility: { object_name: "Hidden", element: "Visible" } },
     { operation: "add", x: 0, y: 80, width: 100, height: 50, custom_text: "Remove me" },

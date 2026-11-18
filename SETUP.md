@@ -222,8 +222,9 @@ which properties are writable and how rotation reads back.
 `ROTDIRECT` quaternion, because the console renormalizes the angles between separate writes, and verified by
 quaternion. Mirroring is the fixture's `MESHMIRRORX` flag (the console ignores scale); mirror pairs across the stage
 centre line, lines and arcs expand into a previewable plan. Refused while the patch copy is open: its commit overwrites
-positions. No undo, so the result carries a restore list. Fixtures inside grouping fixtures are refused (not
-established).
+positions. No undo, so the result carries a restore list. Whether a fixture inside a grouping fixture is positioned
+relative to it is not established: such a fixture is placed only while every grouping fixture above it is at the
+origin with no rotation (both readings then agree), and refused otherwise, naming the grouping fixture.
 
 **Evidence:** six `gma3_lua` calls wrote `POSX/POSY/POSZ/ROTX/ROTY/ROTZ` with hand conversion from feet. Mirroring by
 `SCALEX = -1` was accepted and silently read back as `1`; the agent mirrored with `ROTY = 180`, which read back as
@@ -839,6 +840,10 @@ dialog (KB-25 handles dialogs). This time it answered `OK`, and the bridge kept 
   name?" and, with `overwrite: true`, "... and overwrite existing show file?" dialogs. It refuses another show's file
   without `overwrite`, never answers another dialog, and reports the file written.
 - SaveShow is queued with CmdIndirect, so a dialog cannot stall the bridge.
+- `gma3_load_show` (bridge 0.54.0) loads a show from the shows folder. It answers the unsaved-changes question as
+  `unsaved` says (default refuse) and restarts the bridge the load unloaded: over OSC when this server has an OSC
+  sender, otherwise it waits for an operator (`restart: keystroke` types the start command into onPC on a Mac, opt-in). Probe record [load-show-macos-2.5.1.md](docs/probes/load-show-macos-2.5.1.md); live test
+  `test/live/load-show.live.ts` 3/3 on macOS in the silly82 fork (keystroke restart; the OSC restart is not live-tested).
 
 ## SU-21 — Tags
 
@@ -957,7 +962,40 @@ record [su-22-library-add-macos-2.5.1.md](docs/probes/su-22-library-add-macos-2.
 - The isolation check leaves out the default curve's Min and Max points with their default values: `DmxCurve 1`
   lists one of its two points, and a GDTF import flips which one (the next copy flips it back). Other curves' points,
   an edited end point and the curves themselves are still compared.
+- The isolation check leaves out `ORIGINALFILENAME` (bridge 0.38.1, [patch-left-open](docs/probes/patch-left-open-macos-2.5.1.md)).
+  A second case, live 2026-10-21: after a custom GDTF type ("SC390 Truss") was imported and committed, the live type
+  held the file name and the patch copy had it empty, so the first `gma3_patch_add` of that type refused to commit on
+  a bridge older than 0.38.1. Every other property, mode and name of the type is still compared.
 - Slot colours with a slightly negative component (CIE colours outside sRGB) are read; SU-19's reader refused them.
+
+## SU-23 — Network DMX output on the wire
+
+**Request:** See what the console actually sends as sACN and Art-Net, including while the bridge is down (a show load).
+
+**Depends on:** SU-09.
+
+**Repository:** gma3-mcp.
+
+**Lua changes:** No. The server listens passively on UDP; no bridge request.
+
+**Evidence:** `gma3_dmx` reads values through the bridge, which is gone during `gma3_load_show`, and returns nothing for a
+universe that is not granted. Nothing showed what reached the network after the console's merge and priority.
+
+### Acceptance criteria
+
+- `gma3_network_output` parses E1.31 data packets (root, framing and DMP layers checked) and ArtDmx packets, and
+  reports per universe the protocol, source name and IP, priority, fps, nonzero channels and values (a channel range,
+  or the nonzero ones), with optional timestamped samples.
+- The listener binds on demand with address reuse, joins sACN multicast groups for the universes asked for, and closes
+  after an idle minute. A port held by another application is reported in words.
+- When nothing arrives, the result says why it may be: protocol output off, the universe not granted (onPC without MA
+  hardware may output only a limited number of universes), the sACN or Art-Net destination.
+- Environment: `GMA3_NET_OUTPUT_HOST` (default `0.0.0.0`), `GMA3_NET_OUTPUT_SACN_PORT` (5568),
+  `GMA3_NET_OUTPUT_ARTNET_PORT` (6454), `GMA3_NET_OUTPUT_MULTICAST` (`0` turns joining off), `GMA3_NET_OUTPUT_IDLE_MS`
+  (60000).
+
+**Status:** implemented ([docs/tools/network-output.md](docs/tools/network-output.md), `test/netoutput.test.ts`). Not
+yet verified against a live console.
 
 ## Recommended delivery order
 

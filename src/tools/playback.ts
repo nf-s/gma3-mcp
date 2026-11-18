@@ -152,7 +152,6 @@ export function executorFootprint(executor: number, width: number, height: numbe
 
 const emptyFieldErrors = z.record(z.string(), z.unknown()).refine((fields) => Object.keys(fields).length === 0, "field read errors are not a complete observation");
 const referenceItemSchema = z.object({ invalid: z.literal(false).optional(), fieldErrors: emptyFieldErrors.optional(), class: z.string().optional(), name: z.string().optional(), addr: z.string().optional(), index: z.number().optional(), fields: z.record(z.string(), z.unknown()).optional() });
-const referenceListingSchema = z.object({ total: z.number().int().nonnegative().optional(), items: z.array(referenceItemSchema), enumerationError: z.never().optional() });
 const completeListingSchema = z.object({
   total: z.number().int().nonnegative(),
   enumerationError: z.never().optional(), offset: z.literal(0).optional(), count: z.number().int().nonnegative().optional(),
@@ -380,35 +379,89 @@ export async function findReferences(bridge: Gma3Bridge, addr: string, timeoutMs
   return findReferencesWhere(bridge, (a) => a === addr, timeoutMs);
 }
 
-/** Every executor in the current data pool whose assigned object's address satisfies `match`. Never throws. */
-export async function findReferencesWhere(bridge: Gma3Bridge, match: (addr: string) => boolean, timeoutMs: number, property = "Object", pagesRef = "DataPool.Pages"): Promise<References> {
+/**
+ * Every executor whose assigned object's address satisfies `match`. Never throws.
+ *
+ * `failClosed` (#155 review, gma3_pool_objects' delete gate): anything the scan could not read makes it incomplete,
+ * with the reasons in `error`: a listing the console could not enumerate (enumerationError, bridge 0.47.0), a page or
+ * executor listing that stops before its total, a page without an address or number, an invalid executor, and an
+ * executor whose No or reference read failed (fieldErrors) or has no number. Without it the scan behaves as before (the
+ * other callers only warn or report from it).
+ *
+ * `property` is the executor field that holds the reference, "Object" unless given, and `pagesRef` the page pool to
+ * scan, the current data pool's unless given. An "ExecutorConfiguration" scan (gma3_executor_configuration's delete
+ * gate) always fails closed: a listing that is truncated, could not be enumerated or holds an unreadable item ends the
+ * scan, and an executor whose configuration is neither empty nor an address makes it incomplete.
+ */
+export async function findReferencesWhere(bridge: Gma3Bridge, match: (addr: string) => boolean, timeoutMs: number, opts: { failClosed?: boolean; property?: "Object" | "ExecutorConfiguration"; pagesRef?: string } = {}): Promise<References> {
   const out: References = { complete: false, executors: [], pagesScanned: 0, requests: 0 };
+  type Listing = { total?: number; items?: ObjectSummary[]; enumerationError?: unknown };
+  const strict = opts.failClosed === true;
+  const property = opts.property ?? "Object";
+  const configuration = property === "ExecutorConfiguration";
+  const problems: string[] = [];
   let unreadable = false;
+  const enumFailed = (l: Listing | null | undefined) => l?.enumerationError !== undefined && l?.enumerationError !== null;
+  const listing = async (ref: string, fields: string[], limit: number, what: string): Promise<Listing> => {
+    const raw = await bridge.request("children", { ref, fields, asText: false, limit }, timeoutMs);
+    if (!configuration) return raw as Listing;
+    const parsed = completeListingSchema.safeParse(raw);
+    if (!parsed.success) throw new Error(`the complete ${what} could not be read`);
+    return parsed.data;
+  };
   try {
     out.requests++;
-    const pageResult = (property === "ExecutorConfiguration" ? completeListingSchema : referenceListingSchema).safeParse(await bridge.request("children", { ref: pagesRef, fields: ["No"], asText: false, limit: MAX_REFERENCE_PAGES }, timeoutMs));
-    if (!pageResult.success) throw new Error("the complete page listing could not be read");
-    const pages = pageResult.data;
+    const pages = await listing(opts.pagesRef ?? "DataPool.Pages", ["No"], MAX_REFERENCE_PAGES, "page listing");
+    if (strict && enumFailed(pages)) problems.push(`the pages could not be listed: ${String(pages.enumerationError)}`);
     const items = pages?.items ?? [];
     for (const pg of items) {
-      if (!pg.addr) { unreadable = true; continue; }
+      if (!pg.addr) {
+        if (strict) problems.push(`a page${pg.index !== undefined ? ` (index ${pg.index})` : ""} has no readable address`);
+        if (configuration) unreadable = true;
+        continue;
+      }
       out.requests++;
-      const executorResult = (property === "ExecutorConfiguration" ? completeListingSchema : referenceListingSchema).safeParse(await bridge.request("children", { ref: pg.addr, fields: ["No", property], asText: false, limit: 10000 }, timeoutMs));
-      if (!executorResult.success) throw new Error(`the complete executor listing of ${pg.addr} could not be read`);
-      const execs = executorResult.data;
+      const execs = await listing(pg.addr, ["No", property], 10000, `executor listing of ${pg.addr}`);
       out.pagesScanned++;
       const pageNo = leadingInt(pg.fields?.No) ?? pg.index;
-      if (pageNo === undefined || (execs.total ?? 0) > (execs.items?.length ?? 0)) unreadable = true;
+      if (configuration && pageNo === undefined) unreadable = true;
+      if (strict) {
+        const label = `page ${pageNo ?? pg.addr}`;
+        if (pageNo === undefined) problems.push(`${label} has no readable number`);
+        if (enumFailed(execs)) problems.push(`the executors of ${label} could not be listed: ${String(execs.enumerationError)}`);
+        const got = execs?.items?.length ?? 0;
+        if (typeof execs?.total === "number" && execs.total > got) problems.push(`only ${got} of ${execs.total} executors of ${label} were read`);
+      }
       for (const x of execs?.items ?? []) {
+        if (strict) {
+          const errs = (x.fieldErrors ?? {}) as Record<string, unknown>;
+          const bad = Object.keys(errs).filter((k) => errs[k] !== undefined && errs[k] !== null);
+          if (x.invalid) {
+            problems.push(`an executor of page ${pageNo ?? pg.addr} could not be read (invalid handle)`);
+            continue;
+          }
+          if (bad.length) {
+            problems.push(`executor ${leadingInt(x.fields?.No) ?? "?"} of page ${pageNo ?? pg.addr}: ${bad.map((k) => `${k} could not be read (${String(errs[k])})`).join(", ")}`);
+            continue;
+          }
+          if (leadingInt(x.fields?.No) === undefined) {
+            problems.push(`an executor of page ${pageNo ?? pg.addr} has no readable number`);
+            continue;
+          }
+        }
         const obj = toAssigned(x.fields?.[property]);
         const execNo = leadingInt(x.fields?.No);
-        if (property === "ExecutorConfiguration" && x.class !== "Proxy" && (x.class !== "Executor" || execNo === undefined || x.fields?.[property] !== "" && x.fields?.[property] !== null && !obj?.addr)) unreadable = true;
+        if (configuration && x.class !== "Proxy" && (x.class !== "Executor" || execNo === undefined || x.fields?.[property] !== "" && x.fields?.[property] !== null && !obj?.addr)) unreadable = true;
         if (obj?.addr && match(obj.addr) && pageNo !== undefined && execNo !== undefined) out.executors.push({ page: pageNo, executor: execNo, ref: executorRef(pageNo, execNo), addr: obj.addr });
       }
     }
     const total = pages?.total ?? items.length;
     out.complete = total <= items.length && !unreadable;
     if (!out.complete) out.error = unreadable ? "a page, executor listing or requested reference field could not be read completely" : `only the first ${items.length} of ${total} pages were scanned`;
+    if (problems.length) {
+      out.complete = false;
+      out.error = [...(out.error ? [out.error] : []), ...problems.slice(0, 10), ...(problems.length > 10 ? [`and ${problems.length - 10} more`] : [])].join("; ");
+    }
   } catch (err) {
     out.error = err instanceof Error ? err.message : String(err);
   }
@@ -1119,7 +1172,7 @@ async function configurationReferences(ctx: ToolContext, address: string): Promi
       if (!pool.success) throw new Error(`DataPool ${number}: its children could not be read completely`);
       const pages = pool.data.items.find((child) => child.name?.toLowerCase() === "pages");
       if (!pages?.addr) throw new Error(`DataPool ${number}: the pages pool address is unreadable`);
-      const references = await findReferencesWhere(base, (value) => value === address, ctx.requestTimeoutMs, "ExecutorConfiguration", pages.addr);
+      const references = await findReferencesWhere(base, (value) => value === address, ctx.requestTimeoutMs, { property: "ExecutorConfiguration", pagesRef: pages.addr });
       result.pagesScanned += references.pagesScanned;
       result.requests += references.requests;
       for (const executor of references.executors) result.executors.push({ ...executor, data_pool: number, ref: `DataPool ${number} ${executor.ref}` });

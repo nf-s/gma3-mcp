@@ -13,13 +13,17 @@
  *     Preview programmer. Preset links (abs_preset) read back there as in Normal.
  *   - The programmer keeps its values after a Store, so each cue starts from ClearAll (sent only after the console
  *     confirms Preview: in Normal it would discard the operator's programmer).
- *   - A cue's stored values cannot be read back (no GetCueData on 2.5.1), so each look is checked in the programmer
- *     right before its store; a look that did not apply stops the batch before that cue is stored.
+ *   - Each look is checked in the programmer right before its store; a look that did not apply stops the batch before
+ *     that cue is stored. After the store, the values stored in Part 0 are read with GetPresetData and compared with
+ *     what the store preference (ChannelFilter) was expected to take from the Preview programmer (storeverify.ts,
+ *     live 2026-11-14). With "Active For Selected" only the last look's selection is stored: the values of the cue's
+ *     other looks it keeps out are counted (leftOutByFilter) and the cue's verification is mismatched.
  *   - A cue stored without a name is named after the preset it holds ("[4.901]").
  *   - A Time trigger counts from the previous cue's start (a fade does not lengthen the step); with Wrap Around the
  *     last cue is followed by cue 1 only when cue 1 has a trigger too. `Goto Sequence N Cue C` from off starts the
  *     chase at C. CurrentCue keeps naming the last cue after Off; HasActivePlayback turns true a frame after a Go.
  */
+import { progressSteps, type ProgressSteps } from "../progress.js";
 import { z } from "zod";
 import type { Gma3Bridge } from "../bridge.js";
 import {
@@ -66,6 +70,8 @@ import { SEQUENCE_SETTINGS, configureSequence, findReferences, settingValue, typ
 import { HeldLock } from "../mutations.js";
 import { VarTracker, variablePresence, variableRefs } from "./variables.js";
 import { dataPoolShape, inDataPool } from "./datapool.js";
+import { compactSelection, renderSelection, selectionEntries, splitSelection, type SelectionEntry } from "../selection-batches.js";
+import { captureStoreExpectation, channelFilterWarning, readStorePreferences, verifyStoredValues, type StoreExpectation, type StoredCheck } from "./storeverify.js";
 
 export const MAX_CUES = 100;
 export const MAX_LOOKS = 16;
@@ -74,8 +80,8 @@ const OBSERVE_DEFAULT_S = 45;
 const OBSERVE_MAX_S = 120;
 const SAMPLE_MS = 40;
 
-const NOT_READABLE =
-  "A cue's stored values cannot be read back on 2.5.1 (no GetCueData); each look was checked in the Preview programmer right before its cue was stored.";
+const VALUE_CHECK =
+  "Each look was checked in the Preview programmer right before its cue was stored; after the store, the values stored in Part 0 were read back (GetPresetData) and compared with the programmer values the store preference (ChannelFilter) was expected to take. Preset references and values a merged cue already held are not judged.";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -98,6 +104,8 @@ export interface LookSpec {
   values: ValueSpec[];
   /** SU-14: a phaser built on the look's fixtures (steps and phaser layers, as gma3_build_phaser takes them). */
   phaser?: Effect;
+  /** Set when one look's selection was over the one-command bound and was split: this is part `index` of `of`. */
+  selectionPart?: { index: number; of: number };
 }
 export interface CueSpec {
   cue: string;
@@ -236,15 +244,28 @@ export function validateLooks(v: Validator, raw: Record<string, unknown>, path: 
       return [];
     }
     if (raw.looks.length > MAX_LOOKS) v.fail(`${path}: at most ${MAX_LOOKS} looks per cue`);
-    return raw.looks.slice(0, MAX_LOOKS).flatMap((l, i) => validateLook(v, l, `${path}.looks[${i}]`, defaultFixtures) ?? []);
+    return raw.looks.slice(0, MAX_LOOKS).flatMap((l, i) => splitLook(validateLook(v, l, `${path}.looks[${i}]`, defaultFixtures)));
   }
   if (!shorthand) {
     if (allowEmpty) return [];
     v.fail(`${path}: give its content (presets, intensity, values, phaser or looks), or a command`);
     return [];
   }
-  const look = validateLook(v, raw, path, defaultFixtures);
-  return look ? [look] : [];
+  return splitLook(validateLook(v, raw, path, defaultFixtures));
+}
+
+/**
+ * A look whose selection is over the bound for one grandMA3 command becomes one look per part of it
+ * (selection-batches.ts). Each part is built like any other look (ClearSelection, select, presets, values, releases,
+ * read-back), so every fixture still gets every value and every check; consecutive select commands are never relied on
+ * to add up. A phaser spreads across its whole selection, so a phaser look keeps one (compact) selection command, as
+ * before. Callers that take a single look must take every part (gma3_edit_cue_values does).
+ */
+function splitLook(look: LookSpec | undefined): LookSpec[] {
+  if (!look) return [];
+  const parts = look.phaser ? [compactSelection(look.fixtures)] : splitSelection(look.fixtures);
+  if (parts.length === 1) return [{ ...look, fixtures: parts[0] }];
+  return parts.map((fixtures, i) => ({ ...look, fixtures, selectionPart: { index: i + 1, of: parts.length } }));
 }
 
 /**
@@ -376,8 +397,10 @@ interface CueReport {
   /** The cue's look check (before the store) and property read-back (after), combined. */
   verification: Verification;
   name?: string | null;
-  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string }>;
+  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string; selectionPart?: string }>;
   error?: string;
+  /** The stored-value check after the store: the preference followed and the counts. */
+  storedValues?: StoredCheck["storedValues"];
 }
 
 interface BatchResult {
@@ -423,47 +446,136 @@ function setStep(bridge: Gma3Bridge, name: string, ref: string, property: string
   return { name, run: () => requestStep(bridge, name, "set", args, (res) => ({ name, status: "succeeded", op: "set", detail: { ...args, result: res } }), t) };
 }
 
+/** At most this many selection entries per programmer scan of a look whose groups were expanded (#144). */
+const SCAN_ENTRIES = 50;
+/** At most this many groups in one look's `Group a Thru b`, each read with group.read. */
+const MAX_LOOK_GROUPS = 64;
+
+type ScanRow = Record<string, unknown> & { subfixtureIndex: number; attribute?: string; stepCount?: number };
+interface ScannedFixture {
+  subfixtureIndex?: number;
+  fid?: string | null;
+  name?: string | null;
+  rootFid?: string | null;
+  attributes?: string[];
+}
+/** A look's programmer content and its (sub)fixtures, read over one or more scans. */
+interface LookScan {
+  rows: ScanRow[];
+  fixtures: ScannedFixture[];
+  complete: boolean;
+  /** Why the scan is incomplete. */
+  reason?: string;
+  /** Group members by subfixture index -> fixture id ("101", a cell "101.1"), for reporting. */
+  labels: Map<number, string>;
+}
+
+/**
+ * #144: the selections a look's programmer scan reads. The programmer op resolves `fixtures` as objects and expands only
+ * fixtures and their cells, so a `Group n` reads as no fixture at all (coverage incomplete) and every phaser look on a
+ * group was refused. A look with groups is read through its groups' members instead (group.read: each member's fixture
+ * id, a cell's as "101.1", as gma3_build_phaser resolves a group), in scans of at most SCAN_ENTRIES entries. A group
+ * that cannot be read exactly (missing, truncated, a member without a fixture id, a selection with `-`) is a reason,
+ * never a guess.
+ */
+async function lookScanSelections(bridge: Gma3Bridge, fixtures: string, t: number): Promise<{ selections: string[]; labels: Map<number, string> } | { reason: string }> {
+  const labels = new Map<number, string>();
+  if (!/\bgroup\b/i.test(fixtures)) return { selections: [fixtures], labels };
+  const entries = selectionEntries(fixtures);
+  if (!entries) return { reason: `${fixtures} names a group in a form whose members cannot be read exactly (use + and Thru only)` };
+  const out: SelectionEntry[] = [];
+  for (const e of entries) {
+    if (e.keyword !== "Group") {
+      out.push(e);
+      continue;
+    }
+    const from = Number(e.from);
+    const to = e.to === undefined ? from : Number(e.to);
+    const span = `Group ${e.from}${e.to === undefined ? "" : ` Thru ${e.to}`}`;
+    if (!Number.isInteger(from) || !Number.isInteger(to) || to < from) return { reason: `${span} is not a range of whole group numbers, so its members cannot be read` };
+    if (to - from + 1 > MAX_LOOK_GROUPS) return { reason: `${span} names more than ${MAX_LOOK_GROUPS} groups` };
+    for (let n = from; n <= to; n++) {
+      let g: { truncated?: boolean; items?: Array<{ fixture?: string | null; sfIndex?: number; unreadable?: boolean }> };
+      try {
+        g = (await bridge.request("group.read", { ref: `Group ${n}` }, t)) as typeof g;
+      } catch (err) {
+        return { reason: `the members of Group ${n} could not be read: ${err instanceof Error ? err.message : String(err)}` };
+      }
+      if (g.truncated) return { reason: `Group ${n} has more members than the bridge lists` };
+      for (const it of g.items ?? []) {
+        if (it.unreadable || !it.fixture || typeof it.sfIndex !== "number") return { reason: `Group ${n} holds a member without a fixture id` };
+        out.push({ keyword: "Fixture", from: it.fixture });
+        labels.set(it.sfIndex, it.fixture);
+      }
+    }
+  }
+  if (!out.length) return { reason: `${fixtures} holds no fixtures` };
+  const selections: string[] = [];
+  for (let i = 0; i < out.length; i += SCAN_ENTRIES) selections.push(renderSelection(out.slice(i, i + SCAN_ENTRIES)));
+  return { selections, labels };
+}
+
+/** Read a look's (sub)fixtures and their programmer content (up to `rowLimit` rows per scan; 1 when only the fixtures matter). */
+async function scanLook(bridge: Gma3Bridge, fixtures: string, t: number, rowLimit: number): Promise<LookScan> {
+  const sel = await lookScanSelections(bridge, fixtures, t);
+  if ("reason" in sel) return { rows: [], fixtures: [], complete: false, reason: sel.reason, labels: new Map() };
+  const rows = new Map<string, ScanRow>();
+  const seen = new Map<number | string, ScannedFixture>();
+  for (const selection of sel.selections) {
+    const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures: selection, limit: rowLimit, maxChannels: 50000 }, t)) as {
+      rows?: ScanRow[];
+      scannedFixtures?: ScannedFixture[];
+      coverage?: { complete?: boolean };
+      fixturesTruncated?: boolean;
+      total?: number;
+      limitations?: string[];
+    };
+    const why = scan.limitations?.[0];
+    if (scan.coverage?.complete === false) return { rows: [], fixtures: [], complete: false, reason: `the scan of ${selection} was incomplete${why ? `: ${why}` : ""}`, labels: sel.labels };
+    if (scan.fixturesTruncated === true) return { rows: [], fixtures: [], complete: false, reason: `the scan of ${selection} listed only part of its fixtures`, labels: sel.labels };
+    if (rowLimit > 1 && typeof scan.total === "number" && scan.total > (scan.rows ?? []).length) return { rows: [], fixtures: [], complete: false, reason: `${selection} holds more than ${rowLimit} programmer values`, labels: sel.labels };
+    for (const f of scan.scannedFixtures ?? []) seen.set(typeof f.subfixtureIndex === "number" ? f.subfixtureIndex : `${f.fid}|${f.name}`, f);
+    for (const r of scan.rows ?? []) rows.set(`${r.subfixtureIndex}|${String(r.attribute)}`, r);
+  }
+  return { rows: [...rows.values()], fixtures: [...seen.values()], complete: true, labels: sel.labels };
+}
+
+/**
+ * A look's fixtures (top level, by their root FID; a group member by its own fixture id) and which of them have every
+ * phaser attribute on themselves or a cell.
+ */
+function phaserCoverage(scan: LookScan, attrs: string[]): { supported: Map<number, string>; unsupported: string[] } {
+  const supported = new Map<number, string>();
+  const roots = new Map<string, boolean>();
+  for (const e of scan.fixtures) {
+    const label = typeof e.subfixtureIndex === "number" ? scan.labels.get(e.subfixtureIndex) : undefined;
+    const root = label ?? (e.rootFid && e.rootFid !== "None" ? e.rootFid : e.fid && e.fid !== "None" ? e.fid : (e.name ?? "?"));
+    const has = attrs.every((a) => (e.attributes ?? []).includes(a));
+    roots.set(root, (roots.get(root) ?? false) || has);
+    if (has && typeof e.subfixtureIndex === "number") supported.set(e.subfixtureIndex, label ?? (e.fid && e.fid !== "None" ? e.fid : e.name ?? String(e.subfixtureIndex)));
+  }
+  return { supported, unsupported: [...roots].filter(([, ok]) => !ok).map(([r]) => r) };
+}
+
 /**
  * SU-14: check a look's phaser in the programmer: every (sub)fixture of the look that has the phaser's attributes holds
  * them with the requested steps, step timing and phaser layers, the phase spread over the selection grid (as
  * gma3_build_phaser checks it). Other attributes of the cue (a look's intensity or values) are not judged here; the
  * activation-group siblings that came with the phaser (same step count) are.
  */
-/** A look's fixtures (top level, by their root FID) and which of them have every phaser attribute on themselves or a cell. */
-async function phaserCoverage(bridge: Gma3Bridge, fixtures: string, attrs: string[], t: number): Promise<{ supported: Map<number, string>; unsupported: string[]; complete: boolean }> {
-  const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures, limit: 1, maxChannels: 50000 }, t)) as {
-    scannedFixtures?: Array<{ subfixtureIndex?: number; fid?: string | null; name?: string | null; rootFid?: string | null; attributes?: string[] }>;
-    coverage?: { complete?: boolean };
-    fixturesTruncated?: boolean;
-  };
-  const supported = new Map<number, string>();
-  const roots = new Map<string, boolean>();
-  for (const e of scan.scannedFixtures ?? []) {
-    const root = e.rootFid && e.rootFid !== "None" ? e.rootFid : e.fid && e.fid !== "None" ? e.fid : (e.name ?? "?");
-    const has = attrs.every((a) => (e.attributes ?? []).includes(a));
-    roots.set(root, (roots.get(root) ?? false) || has);
-    if (has && typeof e.subfixtureIndex === "number") supported.set(e.subfixtureIndex, e.fid && e.fid !== "None" ? e.fid : e.name ?? String(e.subfixtureIndex));
-  }
-  return { supported, unsupported: [...roots].filter(([, ok]) => !ok).map(([r]) => r), complete: scan.coverage?.complete !== false && scan.fixturesTruncated !== true };
-}
-
 async function checkLookPhaser(bridge: Gma3Bridge, fixtures: string, effect: Effect, t: number): Promise<Verification> {
   const checked = `the phaser on ${fixtures} in the programmer (steps, step timing, phaser layers, phase per fixture)`;
   try {
-    const scan = (await bridge.request("programmer", { scope: "fixtures", fixtures, limit: 5000, maxChannels: 50000 }, t)) as {
-      rows?: Array<Record<string, unknown> & { subfixtureIndex: number; attribute?: string; stepCount?: number }>;
-      scannedFixtures?: Array<{ subfixtureIndex?: number; fid?: string | null; name?: string | null; attributes?: string[] }>;
-      coverage?: { complete?: boolean };
-    };
-    if (scan.coverage?.complete === false) return unavailable("the programmer scan of the look's fixtures was incomplete", checked);
+    const scan = await scanLook(bridge, fixtures, t, 5000);
+    if (!scan.complete) return unavailable(`the programmer scan of the look's fixtures was incomplete${scan.reason ? ` (${scan.reason})` : ""}`, checked);
     const attrs = effectAttributes(effect);
     // Every fixture of the look must be covered (review round 1): one without the attributes is a mismatch, not left out.
-    const cov = await phaserCoverage(bridge, fixtures, attrs, t);
+    const cov = phaserCoverage(scan, attrs);
     const scope = cov.supported;
     if (cov.unsupported.length) return { status: "mismatched", checked, detail: `fixture(s) ${cov.unsupported.join(", ")} of ${fixtures} have no ${attrs.join(", ")}, so they hold no phaser` };
     if (scope.size === 0) return { status: "mismatched", checked, detail: `no fixture of ${fixtures} has ${attrs.join(", ")}` };
     const n = effect.steps.length;
-    const rows = (scan.rows ?? []).filter((r) => scope.has(r.subfixtureIndex) && (attrs.includes(String(r.attribute)) || (r.stepCount ?? 1) === n));
+    const rows = scan.rows.filter((r) => scope.has(r.subfixtureIndex) && (attrs.includes(String(r.attribute)) || (r.stepCount ?? 1) === n));
     const implied = new Set(rows.map((r) => String(r.attribute)).filter((a) => !attrs.includes(a)));
     const b = verifyBuild({ effect, rows: rows as never, scope, implied, stepPresets: [] });
     return b.problems.length ? { status: "mismatched", checked, detail: b.problems.join("; ") } : { status: "matched", checked };
@@ -501,7 +613,7 @@ export interface PreviewItemReport {
   status: PreviewItemStatus;
   /** The look checks in the programmer before the store (not_requested without verify). */
   verification: Verification;
-  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string }>;
+  looks?: Array<{ fixtures: string; presets: string[]; verification: string; detail?: string; selectionPart?: string }>;
   error?: string;
   /** This item's steps (looks, store), in order. */
   steps: StepResult[];
@@ -532,7 +644,7 @@ export interface PreviewBuild {
  * stay), unless `continueAfterFailure`: then the next item starts again from a confirmed, cleared Preview programmer.
  * An item with an unknown step stops the build either way.
  */
-export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]; verify: boolean; noun: string; inspect?: Array<{ name: string; run: StepFn }>; prepare?: () => Array<{ name: string; run: StepFn }>; continueAfterFailure?: boolean }): Promise<PreviewBuild> {
+export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]; verify: boolean; noun: string; inspect?: Array<{ name: string; run: StepFn }>; prepare?: () => Array<{ name: string; run: StepFn }>; continueAfterFailure?: boolean; /** The store sends its own channel filter (gma3_store_preset: /Active), so ChannelFilter does not limit it to the selection. */ storeFilterExplicit?: string }): Promise<PreviewBuild> {
   const { bridge } = ctx;
   const t = ctx.requestTimeoutMs;
   const warnings: string[] = [];
@@ -577,6 +689,27 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       },
     },
     {
+      // A look split into selection parts leaves only its last part selected at the Store. With a ChannelFilter that
+      // stores only the selected fixtures ("Active For Selected", "All For Selected"), the cue or preset would get only
+      // that part, so split looks need a ChannelFilter that does not depend on the selection. Checked before anything
+      // is sent, with or without verify; the operator's preference is never overridden.
+      name: "check_store_scope",
+      run: async () => {
+        if (!allLooks.some((l) => l.selectionPart)) return asRead({ name: "check_store_scope", status: "succeeded", op: "preset.context", detail: "no look is split: the store takes the look's whole selection" });
+        if (o.storeFilterExplicit) return asRead({ name: "check_store_scope", status: "succeeded", op: "preset.context", detail: { storeOption: o.storeFilterExplicit, note: "the store command sets its own channel filter, so every part of a split look is stored whatever ChannelFilter is" } });
+        let context: { preferences?: Record<string, unknown>; preferencesReadable?: boolean };
+        try {
+          context = (await bridge.request("preset.context", {}, t)) as typeof context;
+        } catch (err) {
+          return asRead(stepFromError("check_store_scope", err, { op: "preset.context" }));
+        }
+        const filter = context.preferencesReadable ? context.preferences?.ChannelFilter : undefined;
+        if (typeof filter !== "string" || filter.trim() === "") return failedRead("check_store_scope", "a look's selection is too long for one command and is built in parts, but the store preference ChannelFilter could not be read, so whether the store would take every part is unknown; nothing was sent. Store the fixtures as a group and give the group instead");
+        if (/for\s*selected/i.test(filter)) return failedRead("check_store_scope", `a look's selection is too long for one command and is built in parts, and the store preference ChannelFilter is ${JSON.stringify(filter)}: the store would take only the last part's fixtures. Nothing was sent. Ask the operator to set ChannelFilter to Active, or store the fixtures as a group and give the group`);
+        return asRead({ name: "check_store_scope", status: "succeeded", op: "preset.context", detail: { ChannelFilter: filter, note: "the store takes every active value, whatever is selected, so every part of a split look is stored" } });
+      },
+    },
+    {
       name: "check_fixtures",
       run: async () => {
         for (const sel of new Set(allLooks.map((l) => l.fixtures))) {
@@ -595,8 +728,9 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
         try {
           for (const look of allLooks.filter((l) => l.phaser)) {
             const attrs = effectAttributes(look.phaser as Effect);
-            const cov = await phaserCoverage(bridge, look.fixtures, attrs, t);
-            if (!cov.complete) return failedRead("check_phaser_fixtures", `the fixtures of ${look.fixtures} could not all be read; nothing was sent`);
+            const scan = await scanLook(bridge, look.fixtures, t, 1);
+            if (!scan.complete) return failedRead("check_phaser_fixtures", `the fixtures of ${look.fixtures} could not all be read${scan.reason ? ` (${scan.reason})` : ""}; nothing was sent`);
+            const cov = phaserCoverage(scan, attrs);
             if (cov.unsupported.length) return failedRead("check_phaser_fixtures", `fixture(s) ${cov.unsupported.join(", ")} of ${look.fixtures} have no ${attrs.join(", ")} (nor any cell with them), so the phaser would leave them out; nothing was sent`, { unsupported: cov.unsupported });
           }
           return asRead({ name: "check_phaser_fixtures", status: "succeeded", op: "programmer" });
@@ -621,6 +755,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
     },
   ]);
   const steps: StepResult[] = [...inspect.steps];
+  let progress: ProgressSteps | undefined;
   if (inspect.outcome !== "succeeded") return { steps, readBack, warnings, items: reports, sent: false, backInNormal: true, normalProgrammer: "not_entered" };
 
   // 2. Build in Preview.
@@ -666,6 +801,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       }
     } else stopped = true;
 
+    progress = progressSteps(o.items.length);
     for (let i = 0; i < o.items.length && !stopped; i++) {
       const item = o.items[i];
       const report = reports[i];
@@ -690,10 +826,12 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
         plan.push({ name: `${pre}clear`, run: () => commandStep(bridge, `${pre}clear`, "ClearAll", t) });
       }
       item.looks.forEach((look, j) => {
-        const lp = `${pre}look ${j + 1} `;
+        // The look's number as given: the parts of a split look share it.
+        const shown = item.looks.slice(0, j + 1).filter((l) => (l.selectionPart?.index ?? 1) === 1).length;
+        const lp = `${pre}look ${shown}${look.selectionPart ? ` (selection part ${look.selectionPart.index}/${look.selectionPart.of})` : ""} `;
         plan.push({ name: `${lp}clear_selection`, run: () => commandStep(bridge, `${lp}clear_selection`, "ClearSelection", t) });
         plan.push({ name: `${lp}select`, run: () => commandStep(bridge, `${lp}select`, look.fixtures, t) });
-        const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested" };
+        const entry: NonNullable<PreviewItemReport["looks"]>[number] = { fixtures: look.fixtures, presets: look.presets.map((p) => p.ref), verification: o.verify ? "matched" : "not_requested", ...(look.selectionPart ? { selectionPart: `${look.selectionPart.index}/${look.selectionPart.of}` } : {}) };
         report.looks!.push(entry);
         const parts: Verification[] = [];
         // A check right after the command it verifies: a later preset in the same look may take over an earlier one's
@@ -704,7 +842,7 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
             const v = await verifyIt();
             parts.push(v);
             lookChecks.push(v);
-            const all = worst(parts, `look ${j + 1} on ${look.fixtures} in the programmer`);
+            const all = worst(parts, `look ${shown}${look.selectionPart ? ` part ${look.selectionPart.index}/${look.selectionPart.of}` : ""} on ${look.fixtures} in the programmer`);
             entry.verification = all.status;
             if (all.detail) entry.detail = all.detail;
             if (v.status === "mismatched") return { name, kind: "read", status: "failed", op: "programmer", error: `${what} did not apply, so ${pre.replace(/: $/, "")} was not stored: ${v.detail}` };
@@ -746,9 +884,11 @@ export async function buildInPreview(ctx: ToolContext, o: { items: PreviewItem[]
       report.status = store?.status === "succeeded" ? (bad ? "failed" : "stored") : store?.status === "unknown" ? "unknown" : "failed";
       if (bad) report.error = `${bad.name}: ${bad.error ?? bad.status}`;
       report.verification = o.verify ? worst(lookChecks, "looks") : notRequested();
+      progress.step(`${o.noun} ${i + 1} of ${o.items.length}: ${report.status}`);
       if (bad && (!o.continueAfterFailure || bad.status === "unknown")) stopped = true;
     }
   } finally {
+    progress?.end();
     // Leave Preview whatever happened, once it may have been entered.
     if (entered) {
       let env: string | null | undefined;
@@ -806,11 +946,31 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
       return asRead({ name: "read_sequence", status: "succeeded", op: "children", detail: { exists: list !== null, cues: list?.length ?? 0, ...(clash.length ? { replaced: clash } : {}) } });
     },
   };
-  const items: PreviewItem[] = b.cues.map((c) => {
+  // The programmer values each store is expected to take, captured in Preview right before it (verify only).
+  const expectations = new Map<number, StoreExpectation>();
+  const filterWarnings: string[] = [];
+  const verifyTimeout = Math.max(t, Math.min(t * 3, 60000));
+  const items: PreviewItem[] = b.cues.map((c, idx) => {
     const pre = `cue ${c.cue}: `;
     const part0 = cueRef(b.sequence, c.cue, 0);
     const cueObj = cueRef(b.sequence, c.cue);
-    const store: Array<{ name: string; run: StepFn }> = [{ name: `${pre}store`, run: () => commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode), t) }];
+    const store: Array<{ name: string; run: StepFn }> = [
+      {
+        name: `${pre}store`,
+        run: async () => {
+          let channelFilter: string | null;
+          if (b.verify) {
+            const exp = await captureStoreExpectation(bridge, verifyTimeout, { leftOut: true });
+            expectations.set(idx, exp);
+            channelFilter = exp.channelFilter;
+          } else channelFilter = (await readStorePreferences(bridge, t)).channelFilter;
+          // A ChannelFilter other than Active is reported once per call, verify or not.
+          const w = channelFilterWarning(channelFilter, { multiLook: true });
+          if (w && !filterWarnings.includes(w)) filterWarnings.push(w);
+          return commandStep(bridge, `${pre}store`, storeCommand(b.sequence, c.cue, b.mode), t);
+        },
+      },
+    ];
     if (c.name !== undefined) store.push(setStep(bridge, `${pre}name`, part0, "Name", c.name, t));
     for (const [k, val] of Object.entries(c.timing) as Array<[keyof CueSpec["timing"], number]>) store.push(setStep(bridge, `${pre}${k}`, part0, TIMING_PROPS[k], val, t));
     if (c.trigger) store.push(setStep(bridge, `${pre}trigger`, cueObj, "TrigType", TRIGGERS[c.trigger], t));
@@ -855,6 +1015,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
   const checkVars = { name: "check_variables", run: () => checkCommandVariables(bridge, byNumber.filter((c) => c.command !== undefined).map((c) => ({ label: `cue ${c.cue}`, command: c.command as string })), t) };
   const built = await buildInPreview(ctx, { items, verify: b.verify, noun: "cues", inspect: [readSequence, checkVars], ...(b.replace ? { prepare: deleteSteps } : {}) });
   const { steps, readBack, warnings, normalProgrammer } = built;
+  warnings.push(...filterWarnings);
   const reports: CueReport[] = b.cues.map((c, i) => {
     const r = built.items[i];
     return { cue: c.cue, status: r.status, verification: r.verification, ...(r.looks ? { looks: r.looks } : {}), ...(r.error ? { error: r.error } : {}) };
@@ -905,7 +1066,20 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
         readBack.push(asRead({ name: `cue ${c.cue}: read_back`, status: "failed", op: "objects", error: message }));
         props = unavailable(`read-back failed: ${message}`, checked);
       }
-      r.verification = worst([r.verification, props], `cue ${c.cue}: looks in the programmer before the store; ${checked}`);
+      const exp = expectations.get(i);
+      let valueCheck: StoredCheck | undefined;
+      if (exp) {
+        valueCheck = await verifyStoredValues(bridge, cueRef(b.sequence, c.cue, 0), exp, verifyTimeout);
+        if (valueCheck.storedValues) r.storedValues = valueCheck.storedValues;
+        readBack.push(asRead({ name: `cue ${c.cue}: read_stored_values`, status: "succeeded", op: "preset.read", detail: { verification: valueCheck.status, ...(valueCheck.detail ? { detail: valueCheck.detail } : {}) } }));
+      }
+      // The looks were asked for this cue: values the preference kept out of the store are missing from it.
+      const leftOut: Verification[] = exp?.leftOut?.count
+        ? [{ status: "mismatched", detail: `ChannelFilter ${JSON.stringify(exp.channelFilter)} stored only the selected fixtures (the last look's selection): ${exp.leftOut.count} value(s) of the cue's other looks are not in it (${exp.leftOut.shown.slice(0, 5).join(", ")}${exp.leftOut.count > 5 ? ", ..." : ""})` }]
+        : exp?.leftOutUnknown
+          ? [unavailable(`whether ChannelFilter ${JSON.stringify(exp.channelFilter)} kept the cue's other looks out could not be judged: ${exp.leftOutUnknown}`)]
+          : [];
+      r.verification = worst([r.verification, props, ...(valueCheck ? [valueCheck] : []), ...leftOut], `cue ${c.cue}: looks in the programmer before the store; ${checked}${valueCheck ? `; ${valueCheck.checked}; every look's values` : ""}`);
     }
   }
 
@@ -916,7 +1090,7 @@ export async function buildCueBatch(ctx: ToolContext, b: Batch): Promise<BatchRe
       ? unavailable("no cue was stored")
       : worst(
           [...attempted.map((r) => ({ ...r.verification, detail: r.verification.detail ? `cue ${r.cue}: ${r.verification.detail}` : undefined })), ...(normalProgrammer === "changed" ? [{ status: "mismatched" as const, detail: "the Normal programmer changed during the build" }] : [])],
-          `${attempted.length} cue(s): each look in the Preview programmer before its store, then the cue's existence, its name, and the timing, trigger, command and note it was given`,
+          `${attempted.length} cue(s): each look in the Preview programmer before its store, then the cue's existence, its name, the timing, trigger, command and note it was given, and the values stored against the store preference`,
         );
   return { steps, readBack, warnings, cues: reports, sent: true, backInNormal: built.backInNormal, normalProgrammer, sequenceExisted, verification: overall };
 }
@@ -1057,7 +1231,8 @@ function batchResult(op: string, target: Record<string, unknown>, r: BatchResult
       cues: r.cues,
       stored: r.cues.filter((c) => c.status === "stored").length,
       normalProgrammer: r.normalProgrammer,
-      notVerified: NOT_READABLE,
+      valueCheck: VALUE_CHECK,
+      ...storedTotals(r.cues),
       ...extra,
     },
   });
@@ -1807,6 +1982,25 @@ const triggerShape = {
   time: z.number().optional().describe("Trigger time in seconds (TrigTime)."),
 };
 
+/** The stored-value counts summed over the cues that were checked (absent when none was). */
+function storedTotals(cues: CueReport[]): { storedValues?: Record<string, unknown> } {
+  const checked = cues.filter((c) => c.storedValues);
+  if (!checked.length) return {};
+  const sum = (k: "expected" | "stored" | "compared" | "missing" | "different" | "leftOutByFilter") => checked.reduce((n, c) => n + (c.storedValues?.[k] ?? 0), 0);
+  const filters = [...new Set(checked.map((c) => c.storedValues?.channelFilter ?? null))];
+  return {
+    storedValues: {
+      channelFilter: filters.length === 1 ? filters[0] : filters,
+      cues: checked.length,
+      expected: sum("expected"),
+      compared: sum("compared"),
+      missing: sum("missing"),
+      different: sum("different"),
+      ...(sum("leftOutByFilter") ? { leftOutByFilter: sum("leftOutByFilter") } : {}),
+    },
+  };
+}
+
 /**
  * The compact form of a store_cues / build_chase result (SU-12): compactResult's step filtering, one line per cue
  * (its status and verification; the look details only for a cue that did not match), and the observed cycle as its
@@ -1824,7 +2018,7 @@ export function compactCueResult(r: OperationResult, detail: boolean): Operation
         verification: c.verification.status,
         ...(c.name !== undefined && c.name !== null ? { name: c.name } : {}),
         ...(c.error ? { error: c.error } : {}),
-        ...(ok ? {} : { detail: c.verification.detail, looks: c.looks }),
+        ...(ok ? {} : { detail: c.verification.detail, looks: c.looks, ...(c.storedValues ? { storedValues: c.storedValues } : {}) }),
       };
     });
   }
@@ -1850,7 +2044,7 @@ const COMPACT_NOTE =
 
 const BUILD_NOTE =
   "Built in the console's Preview environment: its own programmer and selection, so nothing is output and the operator's Normal programmer is untouched (checked before and after). Each cue starts from an empty programmer (ClearAll, sent only in Preview), its looks are applied in order (presets, then intensity, then values; a later look wins on shared fixtures), each look is checked in the programmer (preset links, values per fixture and cell), then the cue is stored. " +
-  "A look that did not apply stops the batch before that cue is stored; the cues already stored stay (nothing is undone or retried) and the result lists every cue with its status. A cue's stored values cannot be read back on 2.5.1; the cue's existence, name, timing, trigger, command and note are. A cue stored without a name takes the preset's name. Requires exclusive: true.";
+  "A look that did not apply stops the batch before that cue is stored; the cues already stored stay (nothing is undone or retried) and the result lists every cue with its status. The cue's existence, name, timing, trigger, command and note are read back, and so are the values stored in Part 0, compared with what the operator's ChannelFilter store preference takes from the programmer (each cue's storedValues gives the counts). With ChannelFilter Active For Selected the console stores only the last look's selection: the values of the cue's other looks are then reported missing (mismatched, nothing re-stored). The plugin expects ChannelFilter Active: any other value is reported once in warnings (read even with verify: false). A cue stored without a name takes the preset's name. Requires exclusive: true.";
 
 export const registerCueListTools: RegisterTools = (server, ctx) => {
   server.registerTool(

@@ -1,4 +1,5 @@
 import net from "node:net";
+import { beatWhilePending, progressBeat } from "./progress.js";
 
 /**
  * JSON-lines over TCP client for the gma3_mcp_bridge Lua plugin running inside grandMA3 onPC.
@@ -68,6 +69,7 @@ export class Gma3Bridge {
   private pending = new Map<string, Pending>();
   private nextId = 1;
   private lastError: string | null = null;
+  private connections = 0;
 
   constructor(private readonly opts: BridgeOptions) {}
 
@@ -77,6 +79,19 @@ export class Gma3Bridge {
 
   get description(): string {
     return `${this.opts.host}:${this.opts.port}`;
+  }
+
+  /**
+   * How many connections this client has established so far (1 after the first connect). A restarted bridge is
+   * reached on a new connection, so a caller can tell whether it reconnected since it last looked.
+   */
+  get connectionCount(): number {
+    return this.connections;
+  }
+
+  /** The bridge port this client connects to (GMA3_BRIDGE_PORT). */
+  get port(): number {
+    return this.opts.port;
   }
 
   get lastErrorMessage(): string | null {
@@ -99,9 +114,12 @@ export class Gma3Bridge {
       };
       sock.setNoDelay(true);
       sock.setTimeout(timeout, () => fail(new BridgeUnreachableError(`connect timeout to ${this.description}`)));
+      // A socket that close() already replaced must not tear down its successor: destroy() emits "close" a tick
+      // later, when a new connection may be up (from silly82/gma3-mcp, found while reconnecting after a show load).
+      const current = () => this.socket === sock || this.socket === null;
       sock.once("error", (err) => {
         if (!settled) fail(err);
-        else this.handleClose(err);
+        else if (current()) this.handleClose(err);
       });
       sock.connect(this.opts.port, this.opts.host, () => {
         settled = true;
@@ -112,7 +130,10 @@ export class Gma3Bridge {
         // setEncoding uses a streaming decoder so multi-byte UTF-8 sequences split across TCP packets are reassembled.
         sock.setEncoding("utf8");
         sock.on("data", (chunk: string) => this.onData(chunk));
-        sock.on("close", () => this.handleClose());
+        sock.on("close", () => {
+          if (current()) this.handleClose();
+        });
+        this.connections++;
         resolve();
       });
     }).finally(() => {
@@ -122,8 +143,9 @@ export class Gma3Bridge {
   }
 
   close(): void {
-    this.socket?.destroy();
+    const sock = this.socket;
     this.socket = null;
+    sock?.destroy();
   }
 
   private handleClose(err?: Error): void {
@@ -180,7 +202,11 @@ export class Gma3Bridge {
     const id = String(this.nextId++);
     const payload = JSON.stringify({ id, op, args }) + "\n";
     const timeout = timeoutMs ?? this.opts.requestTimeoutMs ?? 15000;
-    return new Promise<T>((resolve, reject) => {
+    // Progress for the running tool call (src/progress.ts): a beat per request, and every few seconds while it waits.
+    progressBeat();
+    const sentAt = Date.now();
+    const stopBeats = beatWhilePending(() => `waiting for the console (${op}, ${Math.round((Date.now() - sentAt) / 1000)} s)`);
+    const reply = new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new BridgeError(`timeout after ${timeout}ms waiting for '${op}'`, op, true));
@@ -195,5 +221,6 @@ export class Gma3Bridge {
         }
       });
     });
+    return reply.finally(stopBeats);
   }
 }

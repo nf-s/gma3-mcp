@@ -4,6 +4,7 @@ import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
 import { registerRecipeTools, axisSelection, parseTarget, parseScope, targetRef, lineRef, coverageOf, verifyCoverage, setReplyMatches } from "../src/tools/recipes.ts";
 import { ValidationError } from "../src/validate.ts";
+import { withProgress } from "../src/progress.ts";
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -79,7 +80,7 @@ test("set replies are compared per property", () => {
 // Fake console
 // ---------------------------------------------------------------------------
 
-interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; props?: Record<string, string> }
+interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; sfv?: boolean; props?: Record<string, string> }
 interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean }
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
@@ -104,6 +105,9 @@ class Console {
   truncatedPresets = new Set<string>();
   truncatedGroups = new Set<number>();
   truncatedLines = new Set<FTarget>();
+  /** Fields the bridge fails to read (reported in fieldErrors, left out of fields), and a column list read in part. */
+  failFields = new Set<string>();
+  truncatedColumns = false;
   failAttributes = new Set<string>();
   /** #101: cue objects ("Sequence S Cue C") with the name (Part 0) and note the tools write. */
   cues = new Map<string, { name: string; note: string }>();
@@ -184,7 +188,15 @@ class Console {
       const t = this.targets.get(ref);
       if (!t) throw new Error(`no object found for '${ref}'`);
       // The display-role read of the per-line MAtricks columns (#101).
-      if (args.asText !== false) return { items: t.lines.map((l, i) => ({ class: l.cls, index: i + 1, fields: Object.fromEntries(((args.fields as string[]) ?? []).map((k) => [k, l.props?.[k] ?? "None"])) })) };
+      if (args.asText !== false) {
+        const fields = (args.fields as string[]) ?? [];
+        const ok = fields.filter((k) => !this.failFields.has(k));
+        const bad = fields.filter((k) => this.failFields.has(k));
+        return {
+          ...(this.truncatedColumns ? { total: t.lines.length + 1, offset: 0, count: t.lines.length } : {}),
+          items: t.lines.map((l, i) => ({ class: l.cls, index: i + 1, fields: Object.fromEntries(ok.map((k) => [k, l.props?.[k] ?? "None"])), ...(bad.length ? { fieldErrors: Object.fromEntries(bad.map((k) => [k, "read failed"])) } : {}) })),
+        };
+      }
       return {
         ...(this.truncatedLines.has(t) ? { total: t.lines.length + 1, offset: 0, count: t.lines.length } : {}),
         items: t.lines.map((l, i) => ({
@@ -194,9 +206,10 @@ class Console {
             Selection: l.group !== null ? { name: `Group ${l.group}`, class: "Group", index: l.group, addr: `g.${l.group}` } : "",
             Values: l.preset ? { name: this.presetOf(l.preset)?.[0] ?? "?", class: "Preset", addr: l.preset } : "",
             MAtricks: l.matricks !== null ? { name: `M${l.matricks}`, class: "MAtrick", index: l.matricks } : "",
-            Filter: l.filter ? { name: l.filter, class: "Filter" } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
+            Filter: l.filter ? { name: l.filter, class: "Filter" } : "", SelectionMode: l.mode, SelectionFromValue: l.sfv ?? false, FailedCookedPart: "None", EmptyLastCooking: false,
             X: l.props?.X ?? "None", Y: l.props?.Y ?? "None", Z: l.props?.Z ?? "None",
           },
+          ...(this.failFields.has("Filter") ? { fieldErrors: { Filter: "read failed" } } : {}),
         })),
       };
     });
@@ -655,7 +668,7 @@ test("replace over several cues: the old lines are deleted from the last, the ne
   assert.equal(result.items.length, 2);
   assert.match(result.items[0].summary, /Sequence 9060 Cue 1 Part 0: 2 line\(s\) written in place of 2; 2 line\(s\) read back, matched/);
   assert.equal(result.items[0].result, undefined);
-  assert.deepEqual(result.steps.map((s: { name: string }) => s.name), ["read_cues", "check_references", "item 1: Sequence 9060 Cue 1 Part 0", "item 2: Sequence 9060 Cue 2 Part 0"]);
+  assert.deepEqual(result.steps.map((s: { name: string }) => s.name), ["read_cues", "check_references", "compare_existing", "item 1: Sequence 9060 Cue 1 Part 0", "item 2: Sequence 9060 Cue 2 Part 0"]);
   assert.equal(result.linesSent, 3);
   // The references were read once for the whole call: Group 908 and Preset 1.11 are used twice.
   assert.equal(h.fake.requests.filter((r) => r.op === "group.read" && r.args.ref === "Group 908").length, 1);
@@ -791,6 +804,170 @@ test("cook: every written cue part is cooked with gma3_cook_recipes afterwards",
   assert.ok(con.commands.includes("Cook Sequence 9060 Cue 1 Part 0 /Overwrite"));
 });
 
+test("already done (#145): replace sent again after a lost answer writes nothing for the cue parts that read as asked", async () => {
+  con.cue(9060, 1);
+  con.cue(9060, 2);
+  const cues = [
+    { cue: 1, name: "One", note: "n1", lines: [line(908, "4.4", { name: "a", x: { blocks: 2, select: 1 } }), line(910, "1.11", { matricks: 12 })] },
+    { cue: 2, lines: [line(908, "1.11")] },
+  ];
+  con.groups.set(910, [{ fixture: "403", sfIndex: 65 }]);
+  const first = await store({ mode: "replace", cues });
+  assert.equal(first.result.verification.status, "matched", JSON.stringify(first.result));
+  con.commands = [];
+  h.fake.requests.length = 0;
+  const again = await store({ mode: "replace", cues });
+  assert.equal(again.isError, false, JSON.stringify(again.result));
+  assert.equal(again.result.outcome, "succeeded");
+  assert.equal(again.result.verification.status, "matched");
+  assert.deepEqual(con.commands, [], "nothing is deleted or written again");
+  assert.deepEqual(sets(), []);
+  assert.deepEqual(again.result.items.map((i: { summary: string }) => i.summary), [
+    "Sequence 9060 Cue 1 Part 0: already done: its 2 line(s) already read as asked; nothing was sent.",
+    "Sequence 9060 Cue 2 Part 0: already done: its 1 line(s) already read as asked; nothing was sent.",
+  ]);
+  // One field different: that cue part is written in full again, the other is not.
+  con.commands = [];
+  const changed = await store({ mode: "replace", cues: [cues[0], { cue: 2, lines: [line(908, "4.4")] }] });
+  assert.equal(changed.result.verification.status, "matched", JSON.stringify(changed.result));
+  assert.deepEqual(con.commands, ["Delete Sequence 9060 Cue 2 Part 0.1 /NoConfirmation", "Assign Group 908 At Sequence 9060 Cue 2 Part 0.1", "Assign Preset 4.4 At Sequence 9060 Cue 2 Part 0.1"]);
+  // A disabled line, a MAtricks or an X column the request does not ask for, a different note: written again.
+  for (const tweak of [
+    () => (con.part(9060, 2).lines[0].enabled = false),
+    () => (con.part(9060, 2).lines[0].matricks = 12),
+    () => (con.part(9060, 2).lines[0].props = { X: "1" }),
+  ]) {
+    tweak();
+    con.commands = [];
+    await store({ mode: "replace", cues: [{ cue: 2, lines: [line(908, "4.4")] }] });
+    assert.equal(con.commands.length, 3, `rewritten after ${tweak}`);
+  }
+  con.commands = [];
+  await store({ mode: "replace", cues: [{ ...cues[0], note: "n2" }] });
+  assert.ok(con.commands.length > 0, "a different note is not already done");
+  // Append never treats a repeat as done: the lines are added again.
+  con.commands = [];
+  await store({ mode: "append", cues: [{ cue: 2, lines: [line(908, "4.4")] }] });
+  assert.equal(con.part(9060, 2).lines.length, 2);
+  // Preview says which cue parts would be skipped.
+  const preview = await store({ mode: "replace", preview: true, cues: [{ cue: 1, name: "One", note: "n2", lines: cues[0].lines }] });
+  assert.equal(preview.result.plan[0].alreadyDone, true, JSON.stringify(preview.result.plan));
+  assert.match(preview.result.summary, /1 cue part\(s\) already read as asked and would not be written again/);
+});
+
+test("already done (#145 review): a column the replace leaves out must read as on a new line, or the line is written again", async () => {
+  con.cue(9060, 1);
+  // x: {wings: 2}, then the same line without x: XWings=2 would survive a skip, so the line is rewritten.
+  await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { wings: 2 } })] }] });
+  assert.equal(con.part(9060, 1).lines[0].props?.XWings, "2");
+  con.commands = [];
+  const dropped = await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4")] }] });
+  assert.equal(dropped.result.verification.status, "matched", JSON.stringify(dropped.result));
+  assert.doesNotMatch(dropped.result.items[0].summary, /already done/);
+  assert.deepEqual(con.commands, ["Delete Sequence 9060 Cue 1 Part 0.1 /NoConfirmation", "Assign Group 908 At Sequence 9060 Cue 1 Part 0.1", "Assign Preset 4.4 At Sequence 9060 Cue 1 Part 0.1"]);
+  assert.equal(con.part(9060, 1).lines[0].props?.XWings, undefined, "the new line has no wings");
+  // x: {select: 1, fade: 4..4}, then x: {select: 1}: the fade would survive a skip, so the line is rewritten.
+  await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { select: 1, fade: { from: 4, to: 4 } } })] }] });
+  con.commands = [];
+  const fade = await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { select: 1 } })] }] });
+  assert.doesNotMatch(fade.result.items[0].summary, /already done/);
+  assert.equal(con.commands[0], "Delete Sequence 9060 Cue 1 Part 0.1 /NoConfirmation");
+  assert.equal(con.part(9060, 1).lines[0].props?.FadeFromX, undefined);
+  assert.equal(con.part(9060, 1).lines[0].props?.X, "1");
+  // The same request once more is already done: every column reads as asked or as on a new line.
+  con.commands = [];
+  const same = await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { select: 1 } })] }] });
+  assert.match(same.result.items[0].summary, /already done/);
+  assert.deepEqual(con.commands, []);
+  // Another MAtricks property set on the console (an invert) is not what a new line has: rewritten.
+  con.part(9060, 1).lines[0].props = { ...con.part(9060, 1).lines[0].props, XInv: "Yes" };
+  con.commands = [];
+  await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { select: 1 } })] }] });
+  assert.equal(con.commands[0], "Delete Sequence 9060 Cue 1 Part 0.1 /NoConfirmation");
+});
+
+test("already done (#145 review): a Filter, SelectionFromValue, a name or a selection mode a new line would not have is written again", async () => {
+  con.cue(9060, 1);
+  const req = { mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4")] }] };
+  await store(req);
+  con.commands = [];
+  assert.match((await store(req)).result.items[0].summary, /already done/, "the baseline is already done");
+  for (const [what, tweak] of [
+    ["Filter", (l: FLine) => (l.filter = "Color only")],
+    ["SelectionFromValue", (l: FLine) => (l.sfv = true)],
+    ["name", (l: FLine) => (l.name = "kept")],
+    ["selection mode", (l: FLine) => (l.mode = "Normal")],
+  ] as const) {
+    tweak(con.part(9060, 1).lines[0]);
+    con.commands = [];
+    const r = await store(req);
+    assert.doesNotMatch(r.result.items[0].summary, /already done/, what);
+    assert.equal(con.commands[0], "Delete Sequence 9060 Cue 1 Part 0.1 /NoConfirmation", what);
+    // The rewrite leaves a new line, which is already done again.
+    con.commands = [];
+    assert.match((await store(req)).result.items[0].summary, /already done/, `${what}: after the rewrite`);
+  }
+});
+
+test("already done (#145 review): a column or line field that could not be read, or a column list read in part, is never taken for a default", async () => {
+  con.cue(9060, 1);
+  await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4", { x: { wings: 2 } })] }] });
+  const req = { mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4")] }] };
+  for (const [what, set, clear] of [
+    ["XWings read failed", () => con.failFields.add("XWings"), () => con.failFields.clear()],
+    ["Filter read failed", () => con.failFields.add("Filter"), () => con.failFields.clear()],
+    ["columns read in part", () => (con.truncatedColumns = true), () => (con.truncatedColumns = false)],
+  ] as const) {
+    // Make the console hold a line that is not what the request asks (XWings=2), and fail the read that would show it.
+    con.part(9060, 1).lines[0].props = { XWings: "2" };
+    set();
+    con.commands = [];
+    const r = await store(req);
+    clear();
+    assert.doesNotMatch(r.result.items[0]?.summary ?? r.result.summary, /already done/, what);
+    assert.equal(con.commands[0], "Delete Sequence 9060 Cue 1 Part 0.1 /NoConfirmation", what);
+  }
+});
+
+test("already done (#156 late review): parts of one cue that ask for different notes or names are never skipped", async () => {
+  con.cue(9060, 1);
+  con.cue(9060, 1, 1);
+  // The console: both parts hold the requested line, and the cue's note is B.
+  await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4")] }, { cue: 1, part: 1, note: "B", lines: [line(908, "4.4")] }] });
+  assert.equal(con.cues.get("Sequence 9060 Cue 1")?.note, "B");
+  // Part 0 asks for note A, Part 1 for B: Part 1 already reads as asked but must not be skipped, or Part 0 leaves A.
+  con.commands = [];
+  const { result } = await store({ mode: "replace", cues: [{ cue: 1, note: "A", lines: [line(908, "4.4")] }, { cue: 1, part: 1, note: "B", lines: [line(908, "4.4")] }] });
+  assert.equal(result.outcome, "succeeded", JSON.stringify(result.summary));
+  assert.ok(result.items.every((i: { summary: string }) => !/already done/.test(i.summary)), JSON.stringify(result.items));
+  assert.equal(con.cues.get("Sequence 9060 Cue 1")?.note, "B", "the last part's note wins, as the call asks");
+  // Names the same way.
+  const names = await store({ mode: "replace", cues: [{ cue: 1, name: "One", lines: [line(908, "4.4")] }, { cue: 1, part: 1, name: "Two", lines: [line(908, "4.4")] }] });
+  assert.ok(names.result.items.every((i: { summary: string }) => !/already done/.test(i.summary)));
+  // Parts that agree on the note can still be skipped.
+  con.commands = [];
+  const agree = await store({ mode: "replace", cues: [{ cue: 1, name: "Two", note: "B", lines: [line(908, "4.4")] }, { cue: 1, part: 1, name: "Two", note: "B", lines: [line(908, "4.4")] }] });
+  assert.ok(agree.result.items.every((i: { summary: string }) => /already done/.test(i.summary)), JSON.stringify(agree.result.items));
+  assert.deepEqual(con.commands, []);
+});
+
+test("progress (#145): one unit per written cue part, then one per cooked cue part; none without a token", async () => {
+  for (const c of [1, 2, 3]) con.cue(9060, c);
+  const seen: Array<{ progress: number; total?: number; message?: string }> = [];
+  const extra = { _meta: { progressToken: "p1" }, sendNotification: async (n: { params: Record<string, unknown> }) => void seen.push(n.params as never) };
+  const cues = [1, 2, 3].map((c) => ({ cue: c, lines: [line(908, "4.4")] }));
+  const { result } = await withProgress(extra, () => store({ mode: "append", cues, cook: "merge_low_priority" }));
+  assert.equal(result.outcome, "succeeded", JSON.stringify(result.summary));
+  const units = seen.filter((p) => Number.isInteger(p.progress));
+  assert.deepEqual(units.at(-1), { progressToken: "p1", progress: 6, total: 6, message: "store_recipe_cues: cooked Sequence 9060 Cue 3 Part 0 (succeeded)" });
+  for (let i = 1; i < seen.length; i++) assert.ok(seen[i].progress > seen[i - 1].progress, "progress always increases");
+  assert.ok(seen.every((p) => p.total === undefined || p.progress <= p.total));
+  // Without a token: nothing.
+  const before = seen.length;
+  await withProgress({ sendNotification: extra.sendNotification }, () => store({ mode: "append", cues: [{ cue: 1, lines: [line(908, "4.4")] }] }));
+  assert.equal(seen.length, before);
+});
+
 test("preview checks and plans without sending; detail lists every request", async () => {
   con.cue(9060, 1).lines.push({ cls: "StandardRecipe", group: 908, preset: "14.14.1.5.4.4", matricks: null, enabled: true, name: "", mode: "Strict" });
   const { result } = await store({ mode: "replace", preview: true, detail: true, cues: [{ cue: 1, note: "n", lines: [line(908, "1.11", { x: { blocks: 2 } })] }] });
@@ -822,15 +999,18 @@ test("the call is validated as a whole before anything is read", async () => {
 
 test("values: a number or a quoted string is refused with the plain string form it should be", async () => {
   con.part(9060, 1);
+  // gma3_edit_recipe declares values as a string, so a client never coerces "4.2" into a number; a number is a schema error.
   const num = await edit({ action: "add", selection: 908, values: 4.2 });
-  assert.match(num.result.validationErrors.join(), /values must be the plain string "4\.2" \("<pool>\.<number>"\), not a number: as numbers 4\.20 and 4\.2 are the same/);
-  const int = await edit({ action: "add", selection: 908, values: 4 });
-  assert.match(int.result.validationErrors.join(), /values must be the plain string "<pool>\.<number>" such as "4\.2", not a number/);
+  assert.equal(num.isError, true);
+  assert.match(num.text, /input validation failed[\s\S]*values/);
   const quoted = await edit({ action: "add", selection: 908, values: '"4.2"' });
   assert.match(quoted.result.validationErrors.join(), /values must be the plain string "4\.2", without quotes inside it \(got "\\"4\.2\\""\)/);
   const inBatch = await store({ mode: "append", cues: [{ cue: 1, lines: [{ selection: 908, values: 4.2 }] }] });
   assert.match(inBatch.result.validationErrors.join(), /cues\[0\]\.lines\[0\]\.values must be the plain string "4\.2"/);
   assert.equal(h.fake.requests.length, 0);
+  // The string form passes validation (the preview then reads the show).
+  const str = await edit({ action: "add", selection: 908, values: "4.2", preview: true });
+  assert.ok(!/plain string|input validation failed/.test(str.text), str.text);
 });
 
 test("a line whose X column selects one block is not predicted, so the cook is not a false mismatch; an ordinary line still is", async () => {

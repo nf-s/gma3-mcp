@@ -113,6 +113,8 @@ export interface PresetRead {
   maxDepth?: string | number;
   hasMAtricks?: string;
   inputFilter?: string;
+  /** Entries of the console's References text, which onPC 2.5.1.1 cuts at 1,016 characters: not a count of the preset's users, and not reported by gma3_preset. */
+  referencedBy?: number;
   dependencies: Array<ObjectRefInfo & { contentCrc?: string }>;
   dependenciesReadable?: boolean;
   rows: PresetRow[];

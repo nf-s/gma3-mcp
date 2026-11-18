@@ -13,7 +13,7 @@ the live test procedure on a disposable show.
 | Cue lists and chases in batches (SU-06; built in Preview, needs `exclusive: true`; preset read-back needs bridge 0.27.0) | `gma3_store_cues`, `gma3_edit_cues`, `gma3_build_chase` | [cuelists.md](cuelists.md) |
 | Executors (FR-06) | `gma3_assign_to_executor`, `gma3_label_executor` | [executors.md](executors.md) |
 | Executor authoring | `gma3_configure_executor`, `gma3_executor_configuration` | [playback.md](playback.md) |
-| General Layout pool authoring | `gma3_layouts`, `gma3_store_layout`, `gma3_edit_layout_elements` | [layouts.md](layouts.md) |
+| Layout settings and in-place element edits by GUID (existing bridge ops) | `gma3_layout_elements`, `gma3_configure_layout`, `gma3_edit_layout_elements` | [layout-editing.md](layout-editing.md) |
 | Optional indexed documentation | `gma3_docs_search`, `gma3_docs_get`, `gma3_docs_reference`, indexed `gma3_help` | [docs.md](docs.md) |
 | Structured inspection (FR-07 .. FR-10) | `gma3_fixture_attributes`, `gma3_programmer`, `gma3_fixture_output`, `gma3_dmx`, `gma3_cue_contents` | [inspection.md](inspection.md) |
 | Console input (KB-05, opt-in on the console) | `gma3_input_interaction`, `gma3_hardkey`, `gma3_keyboard`, `gma3_type`, `gma3_input_sequence`, `gma3_hardkeys_status`, `gma3_hardkeys_release_all` | [input.md](input.md) |
@@ -23,19 +23,26 @@ the live test procedure on a disposable show.
 | Fixture-type files into the user library (SU-22, bridge 0.38.0) | `gma3_patch_library_add` | [patch.md](patch.md#gma3_patch_library_add) |
 | Fixtures under a grouping fixture, retyping (bridge 0.42.0 / 0.29.0; need `exclusive: true`) | `gma3_patch_move`, `gma3_patch_retype` | [patch.md](patch.md#gma3_patch_move) |
 | Stages: list, create, rename, remove empty ones (#97, bridge 0.48.0, 0.49.0 for the bridge-side removal checks; changes need `exclusive: true`) | `gma3_patch_stages` | [patch.md](patch.md#gma3_patch_stages) |
+| MVR import: patch and place a rig from a venue plan (#149, bridge 0.58.0; changes need `exclusive: true`) | `gma3_patch_import_mvr` | [mvr.md](mvr.md) |
 | Console dialogs (KB-27 in part, bridge 0.42.0; pressing needs `exclusive: true`) | `gma3_dialog` | [dialog.md](dialog.md) |
 | Fixture-type structure (SU-07, bridge 0.28.0; read-only) | `gma3_patch_type_structure` (and cell counts in `gma3_patch_types`, `gma3_patch_list`) | [patch.md](patch.md) |
 | Fixture positions in 3D (SU-04; no undo, refused while the patch copy is open) | `gma3_fixture_positions`, `gma3_place_fixtures` | [positions.md](positions.md) |
 | Cell layouts (SU-08, bridge 0.29.0; no undo, need `exclusive: true`) | `gma3_layout_cells`, `gma3_assign_cell_layout` | [positions.md](positions.md#cell-layouts-su-08) |
+| Bitmaps: images mapped onto pixels (#143, bridge 0.57.0; apply and store unverified) | `gma3_image_add`, `gma3_build_bitmap`, `gma3_bitmaps` | [bitmaps.md](bitmaps.md) |
+| Layout views: touch layouts of pool objects (#146; no bridge change, unverified on a console) | `gma3_store_layout`, `gma3_layouts` | [layouts.md](layouts.md) |
 | DMX universes and output (SU-09, bridge 0.30.0; changes need `exclusive: true`, network output `network: true`) | `gma3_dmx_output`, `gma3_configure_dmx_output` | [dmx-output.md](dmx-output.md) |
+| Network DMX output on the wire (sACN / Art-Net listener; read-only, no bridge needed) | `gma3_network_output` | [network-output.md](network-output.md) |
 | Executor and sequence playback configuration (SB-01) | `gma3_executor_settings`, `gma3_configure_executor`, `gma3_configure_sequence` | [playback.md](playback.md) |
 | Groups with selection grids and MAtricks (SB-02, bridge 0.21.0; storing a group needs `exclusive: true`) | `gma3_selection_grid`, `gma3_store_group`, `gma3_matricks`, `gma3_configure_matricks` | [groups.md](groups.md) |
 | Presets with explicit storage rules (SB-03, bridge 0.22.0; storing needs `exclusive: true`) | `gma3_preset`, `gma3_store_preset` | [presets.md](presets.md) |
 | Phasers and effect distributions (SB-04, bridge 0.23.0; building needs `exclusive: true`) | `gma3_build_phaser`, `gma3_phaser_release` | [phasers.md](phasers.md) |
-| Recipes and cooking (SB-05, bridge 0.24.0) | `gma3_recipes`, `gma3_edit_recipe`, `gma3_store_recipe_cues`, `gma3_cook_recipes` | [recipes.md](recipes.md) |
+| Recipes and cooking (SB-05, bridge 0.24.0; phaser recipes 0.52.1) | `gma3_recipes`, `gma3_edit_recipe`, `gma3_store_recipe_cues`, `gma3_cook_recipes`, `gma3_edit_phaser_recipe` | [recipes.md](recipes.md) |
 | Shared speed and synchronisation (SB-06; sequence links through `gma3_configure_sequence`) | `gma3_speed_masters`, `gma3_configure_speed_master`, `gma3_speed_master_action`, `gma3_observe_tempo` | [speed.md](speed.md) |
 | Macros as show actions (SB-07; authoring never runs a macro) | `gma3_macros`, `gma3_store_macro`, `gma3_edit_macro_line`, `gma3_run_macro` | [macros.md](macros.md) |
 | Timecode shows (SB-08, bridge 0.25.0; building never plays or records) | `gma3_timecodes`, `gma3_build_timecode`, `gma3_timecode_transport` | [timecode.md](timecode.md) |
+| Pool objects: copy, move, delete, rename with checks (#141, no bridge change) | `gma3_pool_objects` | [pool-objects.md](pool-objects.md) |
+| Filters, worlds, appearances, views (#148, no bridge change; writes unverified on a console) | `gma3_pool_details`, `gma3_store_filter`, `gma3_set_appearance` | [worlds-filters.md](worlds-filters.md) |
+| Agenda: time-of-day and twilight entries that run a sequence, macro, plugin or command (#147, no bridge change; property names and value forms unverified on a console) | `gma3_agenda`, `gma3_store_agenda` | [agenda.md](agenda.md) |
 
 Console variables (SU-15, bridge 0.31.0): `gma3_variables`, `gma3_set_variable` ([variables.md](variables.md)).
 
@@ -49,11 +56,13 @@ ReSync and the tempo-sync plugin (SU-17, no bridge change): `gma3_playback` `res
 Tags (SU-21, bridge 0.36.0): `gma3_tags`, `gma3_store_tag`, `gma3_delete_tag`, `gma3_assign_tag`,
 `gma3_configure_tag`, and `gma3_playback` on a tag ([tags.md](tags.md)).
 
-Saving the show (SU-20, bridge 0.35.0; `exclusive: true`, another show's file needs `overwrite: true`):
-`gma3_show_files`, `gma3_save_show` ([show.md](show.md)).
+Saving and loading the show (SU-20, bridge 0.35.0, loading 0.54.0; `exclusive: true`, another show's file needs
+`overwrite: true`): `gma3_show_files`, `gma3_save_show`, `gma3_load_show` ([show.md](show.md)).
 
 Fixture-type data (SU-19, bridge 0.34.0): `cellOrder` and `wheels` in `gma3_patch_type_structure`
 ([patch.md](patch.md#cell-order-su-19)); `order: "dmx"` in `gma3_layout_cells`; `{cells_of, order}` in group lists.
+
+Undo of tool calls (#142, bridge 0.56.0, needs `GMA3_UNDO_GROUPS=1`): `gma3_undo` ([undo.md](undo.md)).
 
 OSC input and output (SU-18, bridge 0.33.0; changes need `exclusive: true`, a newly opened command port on a
 networked machine `network: true`): `gma3_osc`, `gma3_configure_osc`, `gma3_test_osc_input` ([osc.md](osc.md)).

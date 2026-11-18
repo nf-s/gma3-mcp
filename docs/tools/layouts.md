@@ -1,109 +1,79 @@
-# Layout pool authoring
+# Layout views (#146)
 
-`gma3_layouts`, `gma3_store_layout` and `gma3_edit_layout_elements` inspect and author general Layout pool objects and their elements. They require an explicit `data_pool` number. This is separate from `gma3_layout_cells`, which edits fixture cell geometry in a fixture type.
+Layouts are the 2D views of the Layout pool (`DataPool.Layouts`): pool objects placed as elements on a canvas for
+touch busking. `gma3_store_layout` builds one; `gma3_layouts` reads them.
 
-The bounded initial surface supports decorative elements and Macro, Sequence and Group assignments, integer geometry, class-specific actions, appearance overrides, custom text and element visibility. It does not expose every Layout property or Layout Viewer window setting. It does not open or configure a Viewer, invoke an element, run an assigned macro/sequence, select fixtures or clear programmer values.
+No bridge change: Assign and Delete go through the `cmd` op, element properties through `set` (both refused while
+another client owns input), reads through `objects` and `children` (with `asText: false` an element's `Object` reads
+as `{class, name, addr}`).
 
-The implementation uses existing `objects`, `children`, `object`, `set` and `cmd` bridge operations with arbitrary Lua disabled. It never falls back to OSC or automatically retries an uncertain mutation. Mutations from this server are serialised across preflight, writes and read-back; this does not isolate them from another operator or client.
+## What is known, and from where
 
-## Read layouts
+- onPC 2.5.1.1 (2026-11-17, read-only): Layout 1 "Default" is class `Layout` with layout-level properties
+  (PositionX/Y, DimensionW/H, RenderStyle, ...); its elements are its children. The user profile's
+  `LayoutElementDefaultsCollect` holds the defaults new elements get per object type.
+- MA's system tests shipped with the console (`lib_plugins/systemtests`): `Assign Sequence 1 At <layout>` adds an
+  element as the layout's last child; PositionX/Y, Width, Height, Action, Appearance, CustomTextText and
+  CustomTextColor are set on it; in Lua, `VISIBILITYOBJECTNAME` / `VISIBILITYBORDER` take `"Visible"` / `"Hidden"`.
+- The element editor (`lib_menus/ui/editors/layout_element_editor.uixml`) edits Object, Action, Appearance, PosX,
+  PosY, Width, Height, Name, CustomTextText/Size/Color/AlignmentH/AlignmentV and the Visibility* toggles.
 
-`gma3_layouts` accepts:
+**Not verified on a console**: that an Assign onto an empty layout slot creates the layout (the manual says so for
+fixtures assigned to an empty pool object); how each Visibility* property reads back (the tool accepts
+Visible/On/Yes and Hidden/Off/No); that `Appearance` takes an appearance by name through `set`. The tool reads
+everything back and reports a mismatch rather than assuming.
 
-| Parameter | Meaning |
-| --- | --- |
-| `data_pool` | Required data pool, 1–9999. |
-| `layout` | Optional layout number, 1–9999. Omit to list the pool. |
-| `offset`, `limit` | Zero-based page offset and 1–500 items (default 100). |
-| `schema` | Include the layout's live property schema (default false). |
-
-Pool reads use `children` on the scoped Layouts pool. A specific layout uses `objects` for its fields, then two bounded `children` reads per page: display fields contain the GUID, while `asText:false` returns the assigned Object as a typed handle. Length/address/index differences between those pages are refused. `schema:true` also uses `object`.
-
-A missing layout returns `exists:false`. Element pages return `total`, `offset`, `count`, `incomplete`, and elements with `element` (current number), `guid`, `ref`, `class`, `name` and uppercase `fields`. Read every required page; a page is not a complete layout snapshot. GUIDs and numbers can be unavailable in a read result; editing refuses elements without readable unique identities.
-
-Use the returned `{element, guid}` pair for an update/removal. Element numbers and numeric addresses can shift after deletion; the GUID identifies the surviving element. A stale pair is refused during preflight. Within one batch, later targets are followed by GUID when an earlier removal changes their numbers. Read fresh identities after each call.
-
-## Create or update a layout
-
-`gma3_store_layout` accepts `data_pool`, `layout` and required `mode: "create" | "update"`. Create refuses an occupied number. Update requires an existing layout and at least one supplied setting. A supplied name is checked against the Layout pool before mutation.
-
-| Optional settings | Console properties |
-| --- | --- |
-| `name`, `note` | `Name`, `Note` |
-| `canvas_x`, `canvas_y` | `PositionX`, `PositionY` |
-| `canvas_width`, `canvas_height` | `DimensionW`, `DimensionH` |
-| `view_position_active` | `ViewPosActive` |
-| `view_x`, `view_y`, `view_scale` | `ViewPosX`, `ViewPosY`, `ViewPosScale` |
-| `markers`, `value_colors` | `Markers`, `ValueColors` |
-| `preview` | Read and validate the plan without mutations (default false). |
-
-Canvas coordinates are signed Int16 layout units (−32768…32767); dimensions are 1…32767. View coordinates are signed Int32; `view_scale` is a positive unitless ratio bounded at 10000 (`0.8` means 80%). The console setter takes that ratio but its edit/read roles display percent, so verification compares the read-back to the supplied ratio × 100. Zero is a valid coordinate and false is a supplied boolean. Names and notes follow the existing shared validators; names are trimmed and reject console-stripped punctuation, notes are trimmed.
-
-Commands/requests, in order:
-
-1. Inspect the target, lock flags, name collisions and applicable live schema.
-2. For create only: `Store DataPool <p> Layout <n> /NoConfirmation`, then inspect the created schema.
-3. One `set` request per supplied field, stopping on the first rejected or uncertain write.
-4. `objects` read-back of existence and supplied fields.
-
-No element is removed or rebuilt. An update changes supplied fields only. Names and notes compare literally after shared input normalization. Read-back does not verify how a Viewer renders the layout. A new layout's schema is available only after creation; a later refusal can leave the new empty layout in place and is reported as partial completion.
-
-## Edit elements
-
-`gma3_edit_layout_elements` accepts `data_pool`, `layout`, `edits` (1–100 items) and optional `preview` (default false). The layout must already exist.
-
-Each edit has one of these forms:
+## gma3_store_layout
 
 ```json
-{"operation":"add","x":-120,"y":80,"width":100,"height":50,"object":{"type":"Macro","number":970},"action":"Go+","custom_text":"Start"}
+{
+  "layout": 5,
+  "name": "Busk",
+  "elements": [
+    { "object": "Sequence 1", "x": 0, "y": 0, "width": 120, "height": 80, "text": "Intro", "action": "Go+" },
+    { "object": "Group 2", "x": 130, "y": 0, "show_name": false, "text_color": "FF0000FF" }
+  ],
+  "grid": { "objects": "Sequence 10 Thru 21", "columns": 4, "y": -100, "width": 100, "height": 100, "gap": 10, "skip_missing": true }
+}
 ```
 
-```json
-{"operation":"update","identity":{"element":1,"guid":"<GUID from gma3_layouts>"},"x":0,"visibility":{"object_name":"Hidden"}}
-```
+- **Objects**: one pool object per element: Group, Sequence, Macro, Preset (`4.12`), MAtricks, Quickey, World, View,
+  Plugin, Fixture (`101` or `101.3`), Timecode, Timer. `grid.objects` takes a range (`Sequence 1 Thru 12`,
+  `Preset 4.1 Thru 4.8`) or a `+` list, laid out row by row from (x, y); rows go downwards (smaller y), as MA's own
+  layout tools do. At most 200 elements per call.
+- **Pre-checks** (nothing sent on failure): every object exists (with `grid.skip_missing` a range's empty numbers are
+  left out and the grid closes up over them); the layout slot is free unless `overwrite: true` (Delete Layout, read
+  back gone, then rebuild: the layout's own settings are lost) or `append: true` (add after its elements); the name
+  is free in the Layout pool (`on_name_taken`).
+- **Per element**: `Assign <object> At Layout <n>`. The layout must then have exactly one more element, and its last
+  element must show that object (compared by address); otherwise the call stops before any property is set, since
+  the layout is no longer in the planned state. Then each asked property is set on the element's address.
+- **Read-back**: the whole layout: element count, each new element's object and every asked property, and the
+  layout's name. A property the console ignored or that could not be read is a mismatch.
+- `preview: true` lists the commands and sends nothing. Not retried; an unanswered Assign stops the call.
 
-```json
-{"operation":"remove","identity":{"element":1,"guid":"<GUID from gma3_layouts>"}}
-```
+| Field | Console property | Written as |
+|---|---|---|
+| `x`, `y`, `width`, `height` | PosX, PosY, Width, Height | number |
+| `name` | Name | text |
+| `text` | CustomTextText | text |
+| `action` | Action | e.g. `Go+`, `Toggle`, `Flash`, `SelectFixtures` |
+| `appearance` | Appearance | name |
+| `show_name`, `show_id`, `border`, `bar`, `value` | VisibilityObjectName, VisibilityID, VisibilityBorder, VisibilityBar, VisibilityValue | `Visible` / `Hidden` |
+| `text_size` | CustomTextSize | Default, 10, 12, 14, 16, 18, 20, 24, 28, 32 |
+| `text_color` | CustomTextColor | RRGGBBAA |
+| `align_h`, `align_v` | CustomTextAlignmentH / V | Left, Center, Right, OutsideLeft, OutsideRight / Top, Center, Bottom, Above, Below |
 
-Add requires all four geometry fields. Update changes only supplied fields and requires a setting or assignment. Remove has no change fields. Duplicate identities in one batch are refused. The tool checks the Layout and element `Lock`, `StructureLocked` and `SystemLocked` flags and the live writable-property schema; unknown protection state is a refusal. It does not unlock objects automatically.
+## gma3_layouts
 
-| Change parameter | Meaning / property |
-| --- | --- |
-| `object` | `{type:"Macro"|"Sequence"|"Group", number:1…9999}` in the explicit data pool; resolved to its numeric object address. |
-| `replace_object` | Required true when replacing a different existing assignment. Default false. |
-| `x`, `y`, `width`, `height` | `PosX`, `PosY`, `Width`, `Height`; same Int16 position and positive dimension bounds as above. |
-| `action` | `Action`; validated against the actual assigned object class. |
-| `appearance` | Global Appearance pool number, 1–9999. The override is resolved and verified by address. |
-| `custom_text` | `CustomTextText`, at most 2048 characters, exact case/quotes/internal spaces; no control characters or leading/trailing whitespace. |
-| `custom_text_color` | `CustomTextColor`, eight hexadecimal RGBA digits, e.g. `11AA33FF`. |
-| `custom_text_size` | `CustomTextSize`: `"9"`, `"11"`, `"14"`, `"16"`, `"18"`, `"20"`, `"24"`, `"28"`, `"32"`. |
-| `custom_text_align_h` | `CustomTextAlignmentH`: `Center`, `Left`, `Right`, `OutsideLeft`, `OutsideRight`. |
-| `custom_text_align_v` | `CustomTextAlignmentV`: `Center`, `Top`, `Bottom`, `Above`, `Below`. |
-| `custom_text_vertical` | `CustomTextVertical`, boolean. |
-| `visibility` | Object with optional `element`, `object_name`, `id`, `cid`, `bar`, `value`, `icon`, `indicator_bar`, `border`; each `Visible` or `Hidden`. |
+Read-only. Without `layout`: the pool (number, name, element count). With `layout`: its elements in order, each with
+the object it shows (`{class, name, addr}`), PosX/PosY/Width/Height and the text and visibility properties as
+display text; `complete: false` with an error when the listing could not be read whole.
 
-Macro actions: `<<<`, `>>>`, `Call`, `Go+`, `Go-`, `Off`, `Pause`. Group action: `SelectFixtures`. Sequence actions follow the existing sequence function vocabulary, including Go/Off/Toggle, Flash/Temp/Swap, navigation and speed/rate controls. Unsupported classes/actions are refused rather than relying on the generic Action property's permissive enum. Changing an action configures the future element interaction; it never invokes that action.
+## Live test (throwaway show)
 
-Custom text edge whitespace is refused because read-only bridge strings are trimmed, making independent final verification impossible. Exact case, quotes and internal spacing are verified. Assignment clearing, default-action/default-appearance inheritance controls, padding, borders, image rotation/mirroring, pool/canvas appearances and additional object classes are outside this initial write surface; their available fields can still be inspected generically.
-
-Commands/requests, in order:
-
-1. Inspect the Layout, full element membership/identities, requested object/appearance sources and writable schemas. Refuse invalid targets before mutation; preview stops here and returns `planned`.
-2. Recheck Layout locks, membership and target identity before each item.
-3. Add: `Store DataPool <p> Layout <n>.<next> /NoConfirmation`. Identify exactly one new GUID while preserving prior GUIDs, then inspect its writable schema.
-4. Assignment, if supplied: `set Object` using the resolved numeric address, then `objects asText:false` to compare the actual assigned address. **Do not substitute `Assign Macro … At Layout n.k`: the qualified console appends an element instead of replacing k.**
-5. Appearance, if supplied: `set Appearance` using the source numeric address, then resolve the returned `#<hex>` reference with `object` and compare its address.
-6. Other changes: one `set` per supplied property, checking immediate read-back. Custom text comparisons are literal; numeric/boolean fields use their existing normalizers.
-7. Remove: `Delete DataPool <p> Layout <n>.<current> /NoConfirmation`, then verify exactly the requested GUID disappeared.
-8. Read the resulting elements and verify requested GUIDs, supplied fields, assigned object addresses and appearance identity. Report remaining current identities.
-
-A failure or lost reply stops later mutations and reports unattempted items. Applied earlier changes and newly created elements remain inspectable; the tool does not silently roll back or rebuild. An uncertain creation without an identified GUID is never called verified. Read-back verifies stored configuration, not rendering or successful execution of an assigned macro/sequence.
-
-## Qualification and tests
-
-The source of truth for field names is the running console's schema. The live test passed (1/1) in a disposable show on grandMA3 onPC 2.5.1.1 for macOS with bridge 0.49.0 after checking enum names and write behavior. Cleanup of the reserved objects was verified; no assigned object was executed. This is a bounded qualification, not a claim of every setting or version/platform.
-
-Run `node --import tsx --test test/layouts.test.ts` for the focused fake-bridge suite. It covers explicit scoping, name/number collisions, preview, exact text, locks/read-only schema, identity staleness and renumbering, assignment/action validation, appearance identity, mutation serialization, partial completion and unknown outcomes without replay.
-
-`test/live/layouts.live.ts` is separately opt-in and refuses occupied DataPool 1 Layout 909, Macro 970, Sequence 970 and global Appearance 970. It requires a disposable show and confirmed empty programmer, creates/cleans up those objects, and does not call SaveShow or invoke assigned objects. The root operator runs it; automated unit tests do not establish live console behavior.
+1. `gma3_store_layout {layout: <free>, name: "MCP test", elements: [{object: "Group 1", x: 0, y: 0, width: 100, height: 60, text: "G1", show_name: false}], grid: {objects: "Sequence 1 Thru 4", columns: 2, y: -100, skip_missing: true}}`
+   - expect matched; open the layout on screen and check positions, label, hidden name.
+2. Run it again with `append: true` and one more element; then with `overwrite: true`.
+3. `gma3_layouts {layout: <n>}`: check how the Visibility* properties read (Visible/Hidden or On/Off).
+4. Delete the layout (`gma3_pool_objects {action: "delete", object: "Layout <n>"}`).

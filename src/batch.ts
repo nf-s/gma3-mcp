@@ -21,6 +21,7 @@ import { HeldLock } from "./mutations.js";
 import type { ToolContext } from "./tools/context.js";
 import type { ExecutionOutcome, OperationResult, StepResult, StepStatus, Verification, VerificationOutcome } from "./results.js";
 import { stepFromError, validationFailure } from "./results.js";
+import { progressSteps } from "./progress.js";
 
 /** The batch options every batch form takes. */
 export const batchOptionShape = {
@@ -43,6 +44,10 @@ export interface BatchItem {
   label: string;
   /** The object the item changes; later items on the same object are skipped once one did not succeed. */
   key?: string;
+  /** More objects the item changes (a copy's destination): tracked like `key`. */
+  keys?: string[];
+  /** Objects the item uses without changing them (an appearance it assigns): it is skipped once an earlier item changing one of them did not succeed, but its own failure does not mark them. */
+  depends?: string[];
   run: () => Promise<OperationResult>;
 }
 
@@ -111,6 +116,10 @@ export interface BatchCall {
   identityKeys: string[];
   label: (item: Record<string, unknown>, index: number) => string;
   key?: (item: Record<string, unknown>) => string | undefined;
+  /** Every object an item changes, when more than one (a copy's source and destination); used together with `key`. */
+  keys?: (item: Record<string, unknown>) => string[];
+  /** Objects an item uses without changing them; see BatchItem.depends. */
+  depends?: (item: Record<string, unknown>) => string[];
   /** One item through the single form, with the context to use (its lock is the batch's held span). */
   run: (item: Record<string, unknown>, ctx: ToolContext) => Promise<OperationResult>;
   /** Checks across items (duplicates); any reason refuses the whole call before anything is sent. */
@@ -127,7 +136,7 @@ export async function runBatchCall(args: Record<string, unknown>, c: BatchCall):
   return c.ctx.mutations.run(() =>
     runBatch(
       c.operation,
-      split.items.map((item, i) => ({ label: c.label(item, i), key: c.key?.(item), run: () => c.run(item, held) })),
+      split.items.map((item, i) => ({ label: c.label(item, i), key: c.key?.(item), keys: c.keys?.(item), depends: c.depends?.(item), run: () => c.run(item, held) })),
       { stopOnFailure: args.stop_on_failure === true, detail: args.detail === true },
     ),
   );
@@ -146,29 +155,37 @@ export async function runBatch(operation: string, items: BatchItem[], o: BatchOp
   const entries: BatchEntry[] = [];
   const failedKeys = new Map<string, number>();
   let halted: string | null = null;
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (halted) {
-      entries.push({ label: item.label, skipped: halted });
-      continue;
+  const progress = progressSteps(items.length);
+  try {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (halted) {
+        entries.push({ label: item.label, skipped: halted });
+        continue;
+      }
+      const itemKeys = [...(item.key !== undefined ? [item.key] : []), ...(item.keys ?? [])];
+      const failedOn = [...itemKeys, ...(item.depends ?? [])].find((k) => failedKeys.has(k));
+      if (failedOn !== undefined) {
+        entries.push({ label: item.label, skipped: `not attempted: item ${failedKeys.get(failedOn)} on ${failedOn} did not succeed` });
+        continue;
+      }
+      let result: OperationResult;
+      try {
+        result = await item.run();
+      } catch (err) {
+        const step: StepResult = stepFromError("item", err);
+        result = { operation, target: { item: item.label }, outcome: step.status === "unknown" ? "unknown" : "failed", verification: { status: "not_requested" }, steps: [step], summary: `${item.label}: ${step.error ?? "failed"}` };
+      }
+      entries.push({ label: item.label, result });
+      progress.step(`${operation}: item ${i + 1} of ${items.length} (${item.label}) ${result.outcome}`);
+      if (hasUncertainStep(result)) halted = `not attempted: item ${i + 1} (${item.label}) has a step without a reply that may have changed the console, so its state is not known`;
+      else if (!itemOk(result)) {
+        for (const k of itemKeys) failedKeys.set(k, i + 1);
+        if (o.stopOnFailure) halted = `not attempted: item ${i + 1} (${item.label}) did not succeed and stop_on_failure is set`;
+      }
     }
-    if (item.key !== undefined && failedKeys.has(item.key)) {
-      entries.push({ label: item.label, skipped: `not attempted: item ${failedKeys.get(item.key)} on ${item.key} did not succeed` });
-      continue;
-    }
-    let result: OperationResult;
-    try {
-      result = await item.run();
-    } catch (err) {
-      const step: StepResult = stepFromError("item", err);
-      result = { operation, target: { item: item.label }, outcome: step.status === "unknown" ? "unknown" : "failed", verification: { status: "not_requested" }, steps: [step], summary: `${item.label}: ${step.error ?? "failed"}` };
-    }
-    entries.push({ label: item.label, result });
-    if (hasUncertainStep(result)) halted = `not attempted: item ${i + 1} (${item.label}) has a step without a reply that may have changed the console, so its state is not known`;
-    else if (!itemOk(result)) {
-      if (item.key !== undefined) failedKeys.set(item.key, i + 1);
-      if (o.stopOnFailure) halted = `not attempted: item ${i + 1} (${item.label}) did not succeed and stop_on_failure is set`;
-    }
+  } finally {
+    progress.end();
   }
   return summarizeBatch(operation, entries, o);
 }

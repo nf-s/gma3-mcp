@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { registerCueListTools, expectedOrder, judgeCycle, planObservation } from "../src/tools/cuelists.ts";
+import { registerCueListTools, expectedOrder, judgeCycle, planObservation, buildInPreview, validateLooks } from "../src/tools/cuelists.ts";
+import { Validator } from "../src/validate.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 
@@ -32,6 +33,8 @@ interface Value {
   steps?: number[];
   phase?: number;
   speed?: number;
+  /** A Store deactivated it (live 2026-11-14: the stored values read activeValue 0 afterwards). */
+  inactive?: boolean;
 }
 interface Cue {
   no: number;
@@ -43,6 +46,8 @@ interface Cue {
   part0: Record<string, string>;
   /** fid -> attribute -> value, what was stored. */
   data: Record<string, Record<string, number>>;
+  /** fid -> attribute -> a stored phaser's step values. */
+  steps?: Record<string, Record<string, number[]>>;
 }
 interface Seq {
   name: string;
@@ -53,6 +58,8 @@ interface Seq {
 }
 
 class Console {
+  /** False: preset.context cannot read the store preferences. */
+  prefsReadable = true;
   fixtures: Record<string, string[]> = {
     "101": ["Dimmer", "ColorRGB_R", "ColorRGB_G", "ColorRGB_B"],
     "102": ["Dimmer", "ColorRGB_R", "ColorRGB_G", "ColorRGB_B"],
@@ -85,6 +92,23 @@ class Console {
   running = new Set<number>();
   /** The programmer's current step (Step N). */
   step = 1;
+  /** #144: groups, their members in selection order (fixture ids; a cell is "501.1"). */
+  groups: Record<number, string[]> = {};
+  /** #144: groups whose group.read fails, and groups listing a member without a fixture id. */
+  unreadableGroups = new Set<number>();
+  anonymousMember = new Set<number>();
+
+  /** A (sub)fixture's patch index: a fixture's own id, a cell's one past the fixtures. */
+  sf(fid: string): number {
+    return /^\d+$/.test(fid) ? +fid : 100000 + Object.keys(this.fixtures).indexOf(fid);
+  }
+  /** The ids a `Fixture ...` selection names (each part may repeat the keyword). */
+  ids(expr: string): string[] {
+    return expr.replace(/^Fixture /, "").split("+").map((x) => x.trim().replace(/^Fixture /, "")).flatMap((part) => {
+      const r = part.match(/^(\d+) Thru (\d+)$/);
+      return r ? Object.keys(this.fixtures).filter((f) => /^\d+$/.test(f) && +f >= +r[1] && +f <= +r[2]) : [part];
+    });
+  }
   /** Sequences whose object reply omits hasActivePlayback, and whose listing omits Priority (review round 2). */
   omitPlayback = new Set<number>();
   unreadablePriority = new Set<number>();
@@ -93,6 +117,10 @@ class Console {
   /** #102: the pool listings (children of DataPool.Sequences) read, in order, and whether they fail. */
   listed: string[] = [];
   failPoolList = false;
+  /** Store preferences as preset.context reads them; a Store takes what ChannelFilter selects (live 2026-11-14). */
+  prefs: Record<string, string> = { ChannelFilter: "Active", StoreSource: "Programmer" };
+  /** "fid|attribute" keys a Store leaves out (a console that did not store them). */
+  storeDrops = new Set<string>();
 
   set(fid: string, attr: string, v: Value) {
     const p = this.prog[this.env];
@@ -131,10 +159,9 @@ class Console {
     } else if ((m = cmd.match(/^At Speed ([\d.]+)$/))) {
       for (const f of sel) for (const v of this.prog[this.env].get(f)?.values() ?? []) if (v.steps && v.steps.length > 1) v.speed = +m[1] / 60;
     } else if ((m = cmd.match(/^Fixture (.+)$/))) {
-      for (const part of m[1].split("+").map((x) => x.trim())) {
-        const r = part.match(/^(\d+) Thru (\d+)$/);
-        for (const id of r ? Object.keys(this.fixtures).filter((f) => +f >= +r[1] && +f <= +r[2]) : [part]) if (this.fixtures[id]) sel.add(id);
-      }
+      for (const id of this.ids(cmd)) if (this.fixtures[id]) sel.add(id);
+    } else if ((m = cmd.match(/^Group (\d+)$/))) {
+      for (const id of this.groups[+m[1]] ?? []) sel.add(id);
     } else if ((m = cmd.match(/^At ([\d.]+)$/))) {
       for (const f of sel) if (this.fixtures[f].includes("Dimmer")) this.set(f, "Dimmer", { value: +m[1] });
     } else if ((m = cmd.match(/^Attribute "(.+)" At Absolute(?: Percent)? (-?[\d.]+)$/))) {
@@ -153,9 +180,22 @@ class Console {
       if (p) for (const f of sel) for (const [a, v] of Object.entries(p.values)) if (this.fixtures[f].includes(a)) this.set(f, a, { value: v, preset: key });
     } else if ((m = cmd.match(/^Store Sequence (\d+) Cue ([\d.]+)(?: \/(Merge|Overwrite))? \/NoConfirmation$/))) {
       const data: Cue["data"] = {};
+      const steps: NonNullable<Cue["steps"]> = {};
       let preset: string | undefined;
-      for (const [f, attrs] of this.prog[this.env]) for (const [a, v] of attrs) ((data[f] ??= {})[a] = v.value), (preset ??= v.preset);
+      const filter = this.prefs.ChannelFilter.toLowerCase();
+      for (const [f, attrs] of this.prog[this.env]) {
+        if (filter.includes("selected") && !sel.has(f)) continue;
+        for (const [a, v] of attrs) {
+          if (!filter.startsWith("all") && v.inactive) continue;
+          v.inactive = true;
+          if (this.storeDrops.has(`${f}|${a}`)) continue;
+          (data[f] ??= {})[a] = v.value;
+          if (v.steps && v.steps.length > 1) (steps[f] ??= {})[a] = [...v.steps];
+          preset ??= v.preset;
+        }
+      }
       const c = this.addCue(+m[1], +m[2], data);
+      if (Object.keys(steps).length) c.steps = steps;
       c.name = preset ? `[${preset}]` : `Cue ${m[2]}`;
       if (this.normalChangesOnStore) this.prog.Normal.set("301", new Map([["Dimmer", { value: 1 }]]));
     } else if ((m = cmd.match(/^Delete Sequence (\d+) Cue ([\d.]+)( Thru)? \/NoConfirmation$/))) {
@@ -190,20 +230,20 @@ class Console {
   programmer(args: Record<string, unknown>) {
     const scope = String(args.scope);
     const p = this.prog[this.env];
-    const expr = (e: string) => e.replace(/^Fixture /, "").split("+").map((x) => x.trim()).flatMap((part) => {
-      const r = part.match(/^(\d+) Thru (\d+)$/);
-      return r ? Object.keys(this.fixtures).filter((f) => +f >= +r[1] && +f <= +r[2]) : [part];
-    });
+    const expr = (e: string) => this.ids(e);
+    // The bridge resolves `fixtures` as objects and expands only fixtures and cells: a group is no fixture (#144).
+    if (scope === "fixtures" && /\bGroup\b/.test(String(args.fixtures))) return { scope, environment: this.env, coverage: { complete: false, scannedFixtures: 0, totalFixtures: 0 }, scannedFixtures: [], fixturesTruncated: false, total: 0, rows: [], limitations: [`no (sub)fixture patch indices could be read for '${args.fixtures}'`] };
     const fids = scope === "selection" ? [...this.selected[this.env]] : scope === "fixtures" ? expr(String(args.fixtures)) : [...new Set([...Object.keys(this.fixtures).filter((f) => p.has(f))])];
     const order = [...this.selected[this.env]];
     const rows = fids.flatMap((fid) =>
       [...(p.get(fid) ?? new Map<string, Value>()).entries()].map(([attribute, v]) => ({
         fixture: `Fx ${fid}`,
         fid,
-        subfixtureIndex: +fid,
+        subfixtureIndex: this.sf(fid),
         attribute,
         ...(v.steps && v.steps.length > 1 ? { steps: v.steps.map((x) => ({ absolute: x })), phaser: { gridPos: order.indexOf(fid), phase: v.phase ?? 0, speed: v.speed ?? 1 } } : { value: v.value }),
         stepCount: v.steps?.length ?? 1,
+        masks: { activeValue: v.inactive ? 0 : 2, activePhaser: !v.inactive && v.steps && v.steps.length > 1 ? 2 : 0, individual: 1 },
         physicalFrom: 0,
         physicalTo: 1,
         readout: "Percent",
@@ -216,7 +256,8 @@ class Console {
       scope,
       environment: this.env,
       coverage: { complete: true, scannedFixtures: fids.length, totalFixtures: fids.length, scannedChannels: rows.length },
-      scannedFixtures: fids.map((fid) => ({ subfixtureIndex: +fid, fid, name: `Fx ${fid}`, rootFid: fid, attributes: this.fixtures[fid] })),
+      // A cell has no FID of its own and a name only unique within its fixture.
+      scannedFixtures: fids.map((fid) => (fid.includes(".") ? { subfixtureIndex: this.sf(fid), fid: null, name: fid.split(".")[1], rootFid: null, attributes: this.fixtures[fid] } : { subfixtureIndex: this.sf(fid), fid, name: `Fx ${fid}`, rootFid: fid, attributes: this.fixtures[fid] })),
       fixturesTruncated: false,
       total: rows.length,
       count: Math.min(rows.length, limit),
@@ -257,8 +298,9 @@ class Console {
       const p = this.presets[`${m[1]}.${m[2]}`];
       return p ? { total: 1, items: [{ name: p.name, class: "Preset", addrNative: `ShowData.DataPools.Default.PresetPools.Color.${p.name}`, fields: { Name: p.name } }] } : none;
     }
+    if ((m = ref.match(/^Group (\d+)\b/))) return this.groups[+m[1]] ? { total: 1, items: [{ name: `Group ${m[1]}`, class: "Group" }] } : none;
     if ((m = ref.match(/^Attribute "(.+)"$/))) return Object.values(this.fixtures).some((a) => a.includes(m![1])) ? { total: 1, items: [{ name: m[1], class: "Attribute" }] } : none;
-    const ids = ref.replace(/^Fixture /, "").split("+").map((x) => x.trim()).filter((x) => this.fixtures[x]);
+    const ids = this.ids(ref).filter((x) => this.fixtures[x]);
     return ids.length ? { total: ids.length, items: ids.map((fid) => ({ name: `Fx ${fid}`, class: "Fixture", fields: { FID: fid } })) } : none;
   }
 
@@ -294,6 +336,27 @@ class Console {
     f.reset();
     f.onCommand((cmd) => this.apply(cmd));
     f.on("programmer", (args) => this.programmer(args));
+    f.on("preset.context", () => (this.prefsReadable ? { preferences: { ...this.prefs }, preferencesReadable: true } : { preferences: {}, preferencesReadable: false }));
+    f.on("preset.read", (args) => {
+      const m = String(args.ref).match(/^Sequence (\d+) Cue ([\d.]+) Part 0$/);
+      const c = m ? this.cue(+m[1], +m[2]) : undefined;
+      if (!c) throw new Error(`[not-preset] ${args.ref} does not exist`);
+      const rows = Object.entries(c.data).flatMap(([fid, attrs]) =>
+        Object.entries(attrs).map(([attribute, value]) => {
+          const st = c.steps?.[fid]?.[attribute];
+          return { fixture: fid, sfIndex: this.sf(fid), attribute, value, stepCount: st?.length ?? 1, ...(st ? { steps: st.map((x) => ({ absolute: x })) } : {}) };
+        }),
+      );
+      return { byFixtures: true, rows };
+    });
+    f.on("group.read", (args) => {
+      const n = Number(String(args.ref).replace(/^Group /, ""));
+      if (this.unreadableGroups.has(n)) throw new Error("[unreadable] the SelectionData of Group " + n + " could not be read");
+      const members = this.groups[n];
+      if (!members) throw new Error(`no object found for '${args.ref}'`);
+      const items = members.map((fid, i) => (this.anonymousMember.has(n) && i === 0 ? { sfIndex: this.sf(fid), fixture: null, x: i, y: 0, z: 0 } : { sfIndex: this.sf(fid), fixture: fid, x: i, y: 0, z: 0 }));
+      return { ref: args.ref, count: items.length, truncated: false, unreadable: 0, items };
+    });
     f.on("objects", (args) => this.objects(String(args.ref), Array.isArray(args.fields) ? (args.fields as string[]) : []));
     f.on("children", (args) => {
       if (args.ref === "ShowData.Masters.Speed") return { items: [] };
@@ -385,6 +448,94 @@ test("store_cues: three cues built in Preview, each from its looks, named, timed
     assert.deepEqual([seq.cues[1].trigType, seq.cues[2].trigType, seq.cues[2].trigTime], ["Follow", "Time", 2]);
     assert.deepEqual(c.commands.slice(0, 6), ["Preview On", "[P] ClearSelection", "[P] Fixture 101 + 102", "[P] At Preset 4.1", "[P] At 100", "[P] Store Sequence 951 Cue 1 /NoConfirmation"]);
     assert.deepEqual(c.commands.slice(-2), ["[P] ClearAll", "[P] Preview Off"]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: a 530-fixture look over the one-command bound is built in parts, each selected, valued and checked", async () => {
+  const { h, c } = await setup();
+  try {
+    // Odd 5-digit ids, so no run collapses into a range: 4,245 characters, over the 4,096 one command may hold.
+    const ids = Array.from({ length: 530 }, (_, i) => String(10001 + 2 * i));
+    for (const id of ids) c.fixtures[id] = ["Dimmer", "ColorRGB_R", "ColorRGB_G", "ColorRGB_B"];
+    const { result, isError } = await h.callJson("gma3_store_cues", {
+      sequence: 981, mode: "create", exclusive: true, detail: true,
+      cues: [{ cue: 1, fixtures: ids.join(" + "), presets: [{ pool: 4, preset: 1 }], intensity: 70 }],
+    });
+    assert.equal(isError, false, JSON.stringify(result, null, 2));
+    assert.equal(result.verification.status, "matched");
+    const stored = c.seqs.get(981)!.cues[0].data;
+    assert.equal(Object.keys(stored).length, 530, "every fixture is in the cue");
+    for (const id of ids) assert.deepEqual(stored[id], { ColorRGB_R: 100, ColorRGB_G: 0, ColorRGB_B: 0, Dimmer: 70 }, `fixture ${id}`);
+    const selects = c.commands.filter((cmd) => cmd.startsWith("[P] Fixture "));
+    assert.equal(selects.length, 2);
+    for (const cmd of selects) {
+      const selection = cmd.slice(4);
+      assert(selection.length <= 4096, `${selection.length} characters`);
+      const at = c.commands.indexOf(cmd);
+      assert.deepEqual(c.commands.slice(at - 1, at + 3), ["[P] ClearSelection", cmd, "[P] At Preset 4.1", "[P] At 70"], "each part gets its own ClearSelection and the look's whole content");
+    }
+    assert.deepEqual(selects.flatMap((cmd) => cmd.slice("[P] Fixture ".length).split(" + ")), ids, "the parts select every fixture once, in order");
+    assert.deepEqual(result.cues[0].looks.map((l: any) => [l.selectionPart, l.verification]), ["1/2", "2/2"].map((part) => [part, "matched"]), "each part is reported and checked");
+    const storeAt = c.commands.indexOf("[P] Store Sequence 981 Cue 1 /NoConfirmation");
+    assert(storeAt > c.commands.indexOf(selects[1]), "one store, after the last part");
+    assert.equal(c.commands.filter((cmd) => cmd.startsWith("[P] Store Sequence 981")).length, 1);
+    normalUntouched(c);
+  } finally {
+    await h.close();
+  }
+});
+
+test("buildInPreview: a store that sets its own channel filter (gma3_store_preset /Active) passes the split-look scope check under Active For Selected", async () => {
+  const { h, c } = await setup();
+  try {
+    c.prefs.ChannelFilter = "Active For Selected";
+    const ids = Array.from({ length: 530 }, (_, i) => String(10001 + 2 * i));
+    for (const id of ids) c.fixtures[id] = ["Dimmer"];
+    const v = new Validator();
+    const looks = validateLooks(v, { fixtures: ids.join(" + "), intensity: 70 }, "preset", undefined);
+    assert.ok(v.ok && looks.length === 2, "the look is split in two");
+    let stores = 0;
+    const store = async () => { stores++; return { name: "preset 4.9: store", status: "succeeded" as const, op: "test" }; };
+    const run = (storeFilterExplicit?: string) => buildInPreview(h.ctx, { items: [{ prefix: "preset 4.9: ", looks, store: [{ name: "preset 4.9: store", run: store }] }], verify: false, noun: "presets", inspect: [], ...(storeFilterExplicit ? { storeFilterExplicit } : {}) });
+    const refused = await run();
+    assert.equal(refused.sent, false);
+    assert.match(refused.steps.find((x) => x.name === "check_store_scope")!.error!, /Active For Selected/);
+    const explicit = await run("/Active");
+    assert.equal(explicit.steps.find((x) => x.name === "check_store_scope")!.status, "succeeded");
+    assert.equal(stores, 1, "the store ran");
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: a split look is refused before anything is sent when ChannelFilter stores only the selection, or cannot be read", async () => {
+  for (const [filter, pattern] of [["Active For Selected", /ChannelFilter is "Active For Selected": the store would take only the last part/], ["All For Selected", /ChannelFilter is "All For Selected"/], [null, /ChannelFilter could not be read/]] as Array<[string | null, RegExp]>) {
+    for (const verify of [true, false]) {
+      const { h, c } = await setup();
+      try {
+        if (filter === null) c.prefsReadable = false;
+        else c.prefs.ChannelFilter = filter;
+        const ids = Array.from({ length: 530 }, (_, i) => String(10001 + 2 * i));
+        for (const id of ids) c.fixtures[id] = ["Dimmer"];
+        const before = c.commands.length;
+        const { result, isError } = await h.callJson("gma3_store_cues", { sequence: 981, mode: "create", exclusive: true, verify, cues: [{ cue: 1, fixtures: ids.join(" + "), intensity: 70 }] });
+        assert.equal(isError, true, `${filter} verify ${verify}`);
+        assert.match(errors({ result }), pattern);
+        assert.deepEqual(c.commands.slice(before), [], `${filter} verify ${verify}: nothing was sent`);
+        assert.equal(c.seqs.has(981), false);
+      } finally {
+        await h.close();
+      }
+    }
+  }
+  // A look that is not split stores as before, whatever the ChannelFilter.
+  const { h, c } = await setup();
+  try {
+    c.prefs.ChannelFilter = "Active For Selected";
+    const { isError, result } = await h.callJson("gma3_store_cues", { sequence: 982, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101 + 102", intensity: 50 }] });
+    assert.equal(isError, false, JSON.stringify(result));
   } finally {
     await h.close();
   }
@@ -968,6 +1119,82 @@ test("SU-14 review 1: a look's phaser on a fixture without its attributes is ref
   }
 });
 
+/** #144: the Festoon Demo festoons: fixtures 501/502 (virtual Dimmer) with 40 RGB cells each; Group 1 holds the 80 cells. */
+function festoons(c: Console) {
+  const rgb = ["ColorRGB_R", "ColorRGB_G", "ColorRGB_B"];
+  const cells: string[] = [];
+  for (const p of ["501", "502"]) {
+    c.fixtures[p] = ["Dimmer"];
+    for (let n = 1; n <= 40; n++) {
+      c.fixtures[`${p}.${n}`] = rgb;
+      cells.push(`${p}.${n}`);
+    }
+  }
+  c.groups[1] = cells;
+  return cells;
+}
+
+test("#144: a phaser look on a group of cells is checked through the group's members, built, read back and stored", async () => {
+  const { h, c } = await setup();
+  try {
+    const cells = festoons(c);
+    const r = await h.callJson("gma3_store_cues", {
+      sequence: 990,
+      mode: "create",
+      exclusive: true,
+      cues: [{ cue: 1, fixtures: "Group 1", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }], phaser: { phase: { from: 0, to: 180 } } } }],
+    });
+    assert.equal(r.isError, false, JSON.stringify(r.result).slice(0, 3000));
+    assert.equal(r.result.cues[0].verification, "matched", JSON.stringify(r.result.cues[0]));
+    assert.ok(h.fake.requests.some((q) => q.op === "group.read" && q.args.ref === "Group 1"), "the group's members were read");
+    const scans = h.fake.requests.filter((q) => q.op === "programmer" && q.args.scope === "fixtures").map((q) => String(q.args.fixtures));
+    assert.ok(scans.length >= 2 && scans.every((x) => !/Group/.test(x)), `the scans name the members, not the group: ${scans.join(" | ").slice(0, 300)}`);
+    assert.ok(scans.every((x) => x.split("+").length <= 50), "at most 50 members per scan");
+    assert.ok(c.commands.includes("[P] Group 1"), "the look selects the group itself");
+    const stored = c.seqs.get(990)!.cues[0];
+    assert.deepEqual(Object.keys(stored.steps ?? {}).sort(), [...cells].sort(), "every cell holds the phaser");
+  } finally {
+    await h.close();
+  }
+});
+
+test("#144: a group member without the phaser's attributes is named by its fixture id, and nothing is sent", async () => {
+  const { h, c } = await setup();
+  try {
+    festoons(c);
+    c.groups[2] = ["501.1", "501.2", "301"];
+    const r = await h.callJson("gma3_store_cues", { sequence: 991, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "Group 2", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(r.isError, true);
+    assert.match(errors(r), /fixture\(s\) 301 of Group 2 have no ColorRGB_R/);
+    assert.deepEqual(c.commands, [], "nothing was sent");
+  } finally {
+    await h.close();
+  }
+});
+
+test("#144: a group that cannot be read exactly still refuses the phaser look, with the reason, before anything is sent", async () => {
+  const { h, c } = await setup();
+  try {
+    festoons(c);
+    const phaser = { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] };
+    c.unreadableGroups.add(1);
+    const unreadable = await h.callJson("gma3_store_cues", { sequence: 992, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "Group 1", phaser }] });
+    assert.equal(unreadable.isError, true);
+    assert.match(errors(unreadable), /the fixtures of Group 1 could not all be read \(the members of Group 1 could not be read: .*SelectionData/);
+    c.unreadableGroups.clear();
+    c.anonymousMember.add(1);
+    const anonymous = await h.callJson("gma3_store_cues", { sequence: 992, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "Group 1", phaser }] });
+    assert.match(errors(anonymous), /Group 1 holds a member without a fixture id/);
+    c.anonymousMember.clear();
+    c.groups[3] = ["301"];
+    const minus = await h.callJson("gma3_store_cues", { sequence: 992, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "Group 1 - 501.1", phaser }] });
+    assert.match(errors(minus), /cannot be read exactly/);
+    assert.deepEqual(c.commands, [], "nothing was sent");
+  } finally {
+    await h.close();
+  }
+});
+
 test("SU-14 review 1: each deletion is its own step; a refused one keeps the earlier ones in the result", async () => {
   const { h, c } = await setup();
   try {
@@ -1368,4 +1595,173 @@ test("store_cues: a trigger the console accepts but does not apply is reported a
   } finally {
     await h.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Stored values after the store (storeverify.ts, live 2026-11-14)
+// ---------------------------------------------------------------------------
+
+const twoCues = (sequence: number) => ({
+  sequence,
+  mode: "create",
+  fixtures: "101 + 102",
+  exclusive: true,
+  cues: [
+    { cue: 1, presets: [{ pool: 4, preset: 1 }], intensity: 100 },
+    { cue: 2, looks: [{ fixtures: "101", presets: [{ pool: 4, preset: 2 }] }, { fixtures: "102", intensity: 50, values: [{ attribute: "ColorRGB_B", value: 80, unit: "percent" }] }] },
+  ],
+});
+
+test("store_cues: each cue's Part 0 is read back after its store and compared with what ChannelFilter took from the Preview programmer", async () => {
+  const { h, c } = await setup();
+  try {
+    const { result, isError } = await h.callJson("gma3_store_cues", twoCues(951));
+    assert.equal(isError, false, JSON.stringify(result, null, 2));
+    assert.equal(result.verification.status, "matched");
+    assert.deepEqual(result.storedValues, { channelFilter: "Active", cues: 2, expected: 13, compared: 13, missing: 0, different: 0 }, "cue 1: 2 fixtures x 4; cue 2: 101's colour and 102's Dimmer and Blue");
+    assert.deepEqual(h.fake.requests.filter((r) => r.op === "preset.read").map((r) => r.args.ref), ["Sequence 951 Cue 1 Part 0", "Sequence 951 Cue 2 Part 0"]);
+    assert.match(result.valueCheck, /read back \(GetPresetData\)/);
+    const detailed = await h.callJson("gma3_store_cues", { ...twoCues(952), detail: true });
+    assert.deepEqual(
+      detailed.result.cues.map((x: any) => [x.cue, x.storedValues.expected, x.storedValues.compared]),
+      [["1", 8, 8], ["2", 5, 5]],
+    );
+    // A phaser look: its steps are compared too.
+    const ph = await h.callJson("gma3_store_cues", { sequence: 953, mode: "create", exclusive: true, cues: [{ cue: 1, fixtures: "101 + 102", phaser: { steps: [{ values: { ColorRGB_R: 100 } }, { values: { ColorRGB_R: 0 } }] } }] });
+    assert.equal(ph.result.verification.status, "matched", JSON.stringify(ph.result).slice(0, 2000));
+    assert.deepEqual([ph.result.storedValues.compared, ph.result.storedValues.different], [2, 0]);
+    normalUntouched(c);
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: a value the cue did not store, or stored differently, is a mismatch on that cue; nothing is stored again", async () => {
+  const { h, c } = await setup();
+  try {
+    c.storeDrops.add("102|ColorRGB_B");
+    const { result, isError } = await h.callJson("gma3_store_cues", twoCues(954));
+    assert.equal(isError, true);
+    assert.equal(result.verification.status, "mismatched");
+    assert.deepEqual(result.cues.map((x: any) => [x.cue, x.verification]), [["1", "mismatched"], ["2", "mismatched"]]);
+    assert.match(result.cues[1].detail, /1 expected value\(s\) are not stored \(102 ColorRGB_B\)/);
+    assert.equal(result.cues[1].storedValues.missing, 1);
+    assert.equal(c.commands.filter((x) => /Store Sequence 954 Cue 2 /.test(x)).length, 1, "the store is not retried");
+    // A console that stores another value.
+    c.storeDrops.clear();
+    const read = h.fake.handlerFor("preset.read")!;
+    h.fake.on("preset.read", async (args, req) => {
+      const res = (await read(args, req)) as { rows: Array<{ fixture: string; attribute: string; value: number }> };
+      for (const r of res.rows) if (r.fixture === "101" && r.attribute === "Dimmer") r.value = 90;
+      return res;
+    });
+    const diff = await h.callJson("gma3_store_cues", { sequence: 955, mode: "create", fixtures: "101", exclusive: true, cues: [{ cue: 1, intensity: 40 }] });
+    assert.equal(diff.result.verification.status, "mismatched");
+    assert.match(diff.result.verification.detail, /101 Dimmer: 40 in the programmer, 90 stored/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: with Active For Selected and an incomplete programmer read, no value is claimed as left out; the check is unavailable", async () => {
+  for (const incomplete of ["all", "selection"]) {
+    const { h, c } = await setup();
+    try {
+      c.prefs.ChannelFilter = "Active For Selected";
+      const prog = h.fake.handlerFor("programmer")!;
+      h.fake.on("programmer", async (args, req) => {
+        const res = (await prog(args, req)) as Record<string, unknown>;
+        // Only the reads right before a store: the look checks read with other scopes.
+        return args.scope === incomplete && args.maxChannels === 50000 ? { ...res, coverage: { complete: false } } : res;
+      });
+      const { result } = await h.callJson("gma3_store_cues", twoCues(957));
+      const cue2 = result.cues[1];
+      assert.notEqual(cue2.verification, "mismatched", `${incomplete}: ${JSON.stringify(cue2)}`);
+      assert.equal(cue2.verification, "unavailable", incomplete);
+      assert.equal(cue2.storedValues?.leftOutByFilter, undefined, `${incomplete}: nothing counted as left out`);
+      assert.equal(result.storedValues?.leftOutByFilter, undefined);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("store_cues: with Active For Selected only the last look's selection is stored; the other looks' values are reported missing", async () => {
+  const { h, c } = await setup();
+  try {
+    c.prefs.ChannelFilter = "Active For Selected";
+    const { result, isError } = await h.callJson("gma3_store_cues", twoCues(956));
+    assert.equal(isError, true);
+    assert.deepEqual(result.cues.map((x: any) => [x.cue, x.verification]), [["1", "matched"], ["2", "mismatched"]], "one look on both fixtures stores everything");
+    assert.match(result.cues[1].detail, /ChannelFilter "Active For Selected" stored only the selected fixtures \(the last look's selection\): 3 value\(s\) of the cue's other looks are not in it \(101 ColorRGB_R, 101 ColorRGB_G, 101 ColorRGB_B\)/);
+    assert.deepEqual([result.cues[1].storedValues.expected, result.cues[1].storedValues.compared, result.cues[1].storedValues.leftOutByFilter], [2, 2, 3]);
+    assert.equal(result.storedValues.leftOutByFilter, 3);
+    assert.deepEqual(
+      result.warnings.filter((w: string) => /ChannelFilter/.test(w)),
+      ['Store preference ChannelFilter is "Active For Selected": a store takes only the selected fixtures\' values, so a cue with several looks keeps only its last look. The plugin\'s cue tools expect "Active" (set it in the user profile\'s store preferences).'],
+      "once per call, not per cue",
+    );
+    assert.deepEqual(Object.keys(c.cue(956, 2)!.data), ["102"], "the fake console stored what the preference takes");
+    assert.ok(h.fake.requests.some((r) => r.op === "programmer" && r.args.scope === "selection"));
+  } finally {
+    await h.close();
+  }
+});
+
+test("store_cues: an unmodelled ChannelFilter compares what it finds but does not judge completeness; verify false reads nothing more", async () => {
+  const { h, c } = await setup();
+  try {
+    c.prefs.ChannelFilter = "Selective";
+    const { result, isError } = await h.callJson("gma3_store_cues", { sequence: 957, mode: "create", fixtures: "101", exclusive: true, cues: [{ cue: 1, intensity: 40 }] });
+    assert.equal(isError, false);
+    assert.equal(result.verification.status, "unavailable");
+    assert.match(result.verification.detail, /1 value\(s\) compared and matched, completeness not judged: ChannelFilter "Selective" with StoreSource "Programmer" is not modelled/);
+    assert.match(result.warnings.join(" "), /ChannelFilter is "Selective": the plugin does not model what a store then takes/);
+    h.fake.requests.length = 0;
+    c.prefs.ChannelFilter = "Active";
+    const off = await h.callJson("gma3_store_cues", { sequence: 958, mode: "create", fixtures: "101", exclusive: true, verify: false, cues: [{ cue: 1, intensity: 40 }, { cue: 2, intensity: 50 }] });
+    assert.equal(off.isError, false);
+    assert.deepEqual(h.fake.requests.filter((r) => r.op === "preset.context" || r.op === "preset.read").map((r) => r.op), ["preset.context", "preset.context"], "verify false: only the preference, before each store");
+    assert.equal(off.result.warnings, undefined);
+  } finally {
+    await h.close();
+  }
+});
+
+// Review of #129: every stored layer the programmer holds is compared, and an expected value that could not be
+// compared is never "matched".
+test("stored values: relative values, phaser step layers and missing step absolutes are compared; uncompared cells are unavailable", async () => {
+  const { verifyStoredValues } = await import("../src/tools/storeverify.ts");
+  const bridgeWith = (rows: unknown[]) => ({ request: async () => ({ rows, byFixtures: true }) }) as never;
+  const exp = (rows: unknown[]) => ({ channelFilter: "Active", storeSource: "Programmer", model: "active" as const, rows: rows as never, complete: true });
+  const check = (prog: unknown[], stored: unknown[]) => verifyStoredValues(bridgeWith(stored), "Sequence 1 Cue 1 Part 0", exp(prog), 1000);
+  const pan = { fid: "101", subfixtureIndex: 1, attribute: "Pan", value: 50 };
+
+  // A changed or lost relative value.
+  let v = await check([{ ...pan, relative: 20 }], [{ fixture: "101", attribute: "Pan", value: 50, relative: 0 }]);
+  assert.equal(v.status, "mismatched");
+  assert.match(v.detail!, /101 Pan: relative 20 in the programmer, 0 stored/);
+  v = await check([{ ...pan, relative: 20 }], [{ fixture: "101", attribute: "Pan", value: 50 }]);
+  assert.match(v.detail!, /relative 20 in the programmer, no relative value stored/);
+  v = await check([{ fid: "101", subfixtureIndex: 1, attribute: "Pan", value: null, relative: 20 }], [{ fixture: "101", attribute: "Pan", relative: 20 }]);
+  assert.equal(v.status, "matched", "a relative-only value that matches");
+
+  // Phaser steps: a missing stored absolute, a different relative or timing layer; absent stored timing is its default.
+  const prog = (steps: unknown[]) => [{ fid: "101", subfixtureIndex: 1, attribute: "Dimmer", stepCount: 2, steps }];
+  const stored = (steps: unknown[]) => [{ fixture: "101", attribute: "Dimmer", stepCount: 2, steps }];
+  v = await check(prog([{ absolute: 100 }, { absolute: 0 }]), stored([{ step: 1, absolute: 100 }, { step: 2 }]));
+  assert.equal(v.status, "mismatched");
+  assert.match(v.detail!, /step 2 absolute: 0 in the programmer, none stored/);
+  v = await check(prog([{ absolute: 100, relative: 10 }, { absolute: 0 }]), stored([{ step: 1, absolute: 100, relative: 0 }, { step: 2, absolute: 0 }]));
+  assert.match(v.detail!, /step 1 relative: 10 in the programmer, 0 stored/);
+  v = await check(prog([{ absolute: 100, width: 50 }, { absolute: 0, trans: 0 }]), stored([{ step: 1, absolute: 100, width: 50 }, { step: 2, absolute: 0 }]));
+  assert.match(v.detail!, /step 2 transition: 0 in the programmer, 100 stored/);
+  v = await check(prog([{ absolute: 100, width: 100, accel: 0 }, { absolute: 0 }]), stored([{ step: 1, absolute: 100 }, { step: 2, absolute: 0 }]));
+  assert.equal(v.status, "matched", "a timing layer at its default is left out of the stored step");
+
+  // A cell without its own FID whose stored row is not found: not compared, so unavailable, with the counts kept.
+  v = await check([{ fid: null, subfixtureIndex: 9, attribute: "Dimmer", value: 80 }], []);
+  assert.equal(v.status, "unavailable");
+  assert.match(v.detail!, /1 expected value\(s\) could not be compared/);
+  assert.deepEqual([v.storedValues!.expected, v.storedValues!.compared, v.storedValues!.notCompared], [1, 0, 1]);
 });

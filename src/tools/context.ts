@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Gma3Bridge } from "../bridge.js";
 import type { MutationLock } from "../mutations.js";
+import type { UndoGroups } from "../undo.js";
 import type { OscOptions } from "../osc.js";
 import type { OperationResult, ToolResult } from "../results.js";
 import { toToolResult } from "../results.js";
@@ -10,12 +11,18 @@ export interface ToolContext {
   bridge: Gma3Bridge;
   /** Serialises mutations from this server; see mutations.ts. */
   mutations: MutationLock;
+  /** The undo groups the lock opens (GMA3_UNDO_GROUPS, src/undo.ts); gma3_undo reads their history. */
+  undo?: UndoGroups;
   /** Default per-request timeout in ms. */
   requestTimeoutMs: number;
   /** Whether the gma3_lua tool is registered (workflow tools never depend on it). */
   luaToolAllowed: boolean;
   /** The server's own OSC sender (GMA3_OSC_HOST / _PORT / _PREFIX), for gma3_osc's report. */
   osc?: OscOptions;
+  /** Sends a command over OSC (/cmd): gma3_load_show restarts the bridge with it after the load unloaded it. */
+  oscCommand?: { sendCommand(command: string): Promise<void>; readonly description: string };
+  /** Types a command into onPC on this Mac (src/keystroke.ts): gma3_load_show's restart without OSC. */
+  keystroke?: { available(): Promise<boolean>; sendCommand(command: string): Promise<void>; readonly description: string };
 }
 
 export type RegisterTools = (server: McpServer, ctx: ToolContext) => void;
