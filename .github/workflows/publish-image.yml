@@ -1,0 +1,53 @@
+name: Publish container image
+
+# A maintainer stages a tested 'docker save' archive as images.tar.zst on a
+# draft release named image-<short revision>. The digest comes from the build host.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full commit SHA used to build both architecture tags
+        required: true
+      sha256:
+        description: SHA-256 of images.tar.zst
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency: publish-container-image
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      REVISION: ${{ inputs.revision }}
+      ARCHIVE_SHA: ${{ inputs.sha256 }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Load and verify the staged builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" =~ ^[a-f0-9]{40}$ && "$ARCHIVE_SHA" =~ ^[a-f0-9]{64}$ ]]
+          gh release download "image-${REVISION:0:7}" --repo "$GITHUB_REPOSITORY" --pattern images.tar.zst
+          echo "$ARCHIVE_SHA  images.tar.zst" | sha256sum --check -
+          zstd -dc images.tar.zst | docker load
+          for arch in amd64 arm64; do
+            tag="$IMAGE:${REVISION:0:7}-$arch"
+            test "$(docker image inspect --format '{{.Architecture}}' "$tag")" = "$arch"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$tag")" = "$REVISION"
+          done
+      - name: Publish architecture tags and the multi-platform index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          short=${REVISION:0:7}
+          docker push "$IMAGE:$short-amd64"
+          docker push "$IMAGE:$short-arm64"
+          docker buildx imagetools create --tag "$IMAGE:$short" --tag "$IMAGE:latest" "$IMAGE:$short-amd64" "$IMAGE:$short-arm64"
