@@ -11,12 +11,13 @@ Copy this into Claude or ChatGPT with local computer access:
 ```text
 Set up https://github.com/nf-s/gma3-mcp on the computer running my grandMA3 onPC.
 Clone or safely update the fork, use Node.js 24+ to run npm ci and npm run build, and
-configure my ChatGPT or Claude client to launch it. For a new setup, set GMA3_DOCS_URL=hosted
-in the MCP server environment. Preserve any existing local docs setting. Verify a manual
+configure my ChatGPT or Claude client to launch it. For a new setup, set
+GMA3_DOCS_URL=https://ma3-docs.pages.dev in the MCP server environment. Preserve any
+existing local docs setting. Verify a manual
 lookup, then reuse or help me start the onPC bridge and check the connection with gma3_status.
 ```
 
-The client starts the MCP server when it connects. If your chat lacks local computer access,
+The snippet uses the [hosted docs](https://ma3-docs.pages.dev). The client starts the MCP server when it connects. If your chat lacks local computer access,
 it can walk you through the same steps. [Detailed setup prompt](docs/setup/ai-setup-prompt.md)
 
 ## Manual setup

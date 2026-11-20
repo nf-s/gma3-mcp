@@ -25,7 +25,8 @@ rather than overwriting existing JSON. ChatGPT desktop uses its MCP settings or 
 config.toml. Follow the web guide for ChatGPT web; local configuration and bridge TCP are
 not web MCP URLs. Check actual transport availability and required approvals.
 
-For new configurations set GMA3_DOCS_URL=hosted; preserve existing explicit local deployments.
+For a new configuration set GMA3_DOCS_URL=https://ma3-docs.pages.dev in the gma3 server
+environment. Preserve an existing local docs URL.
 The local alternative is http://127.0.0.1:8765 with a separately running index. Restart the
 MCP server. Before console import, verify gma3_docs_search, gma3_docs_get and
 gma3_docs_reference using returned IDs, source links and version provenance; test gma3_help.

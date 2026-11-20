@@ -6,7 +6,7 @@ Choose a documentation source in the MCP server's environment and restart the se
 
 | `GMA3_DOCS_URL` | Documentation source |
 | --- | --- |
-| `hosted` | Queries the shared index over HTTPS. The setup prompt uses this for new installations. |
+| `https://ma3-docs.pages.dev` or `hosted` | Queries the [hosted docs](https://ma3-docs.pages.dev). The setup prompt uses the full URL for new installations. |
 | `http://127.0.0.1:8765` | Queries the index running on the same machine as the MCP. Follow the [ma3-docs setup guide](https://github.com/nf-s/ma3-docs#build-the-local-index) to import publications and start it. |
 | Unset | Reads the manual installed with onPC through `gma3_help`. |
 
