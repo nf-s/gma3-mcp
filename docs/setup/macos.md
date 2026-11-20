@@ -12,7 +12,7 @@ image; the package requires Node.js 24 or newer. Launch onPC once to create its 
 Run these commands in Terminal:
 
 ```bash
-git clone https://github.com/bdstark/gma3-mcp.git
+git clone https://github.com/nf-s/gma3-mcp.git
 cd gma3-mcp
 npm ci
 npm run build
@@ -26,10 +26,9 @@ Keep using this repository directory for the remaining Terminal commands.
 npm run install-plugin
 ```
 
-The installer copies both plugin files into
+The installer copies the plugin XML and all four Lua components into
 `~/MALightingTechnology/gma3_library/datapools/plugins/`. If you use a custom library location, copy
-`plugin/gma3_mcp_bridge.lua`, `plugin/gma3_mcp_hardkeys.lua`, `plugin/gma3_mcp_feedback.lua` and
-`plugin/gma3_mcp_bridge.xml` into its `datapools/plugins/` folder manually.
+`plugin/gma3_mcp_bridge.xml` and every `plugin/gma3_mcp_*.lua` file into its `datapools/plugins/` folder manually.
 
 ## 3. Import and start the bridge in onPC
 
@@ -46,6 +45,9 @@ The target slot is required. Save the show to retain the imported plugin, then s
 each time you load the show. Arbitrary Lua stays disabled; normal tools work without enabling it.
 
 ## 4. Configure your MCP client
+
+For indexed manual search, set `GMA3_DOCS_URL` in the environment of the `gma3` server.
+The [documentation settings](../tools/docs.md) cover hosted and local indexes.
 
 Choose [ChatGPT desktop](#chatgpt-desktop), [ChatGPT web](chatgpt-web.md), or
 [Claude Code / Claude Desktop](#claude-code-and-claude-desktop).

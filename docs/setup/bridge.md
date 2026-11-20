@@ -12,10 +12,10 @@ Import Plugin Library "gma3_mcp_bridge.xml" At Plugin 1
 Plugin "gma3_mcp_bridge"
 ```
 
-Look for `MCP Bridge: listening on 127.0.0.1:9800` in command history or System Monitor, preceded by
-`MCP Bridge: modules: hardkeys 0.4.0, feedback 0.2.0` (the [console interaction modules](../modules.md)
-shipped as extra components of the same XML; a `FAILED` entry there means the XML was imported without
-all of its components).
+Look for `MCP Bridge: listening on 127.0.0.1:9800` in command history or System Monitor, along with a module
+summary showing versions for hardkeys, feedback and control. If a module reports `FAILED`, check
+that every Lua file named by the XML was copied to the same library folder.
+[Console interaction modules](../modules.md)
 The target slot is required. Save the show to retain the imported plugin, then start the plugin again
 each time you load the show. Arbitrary Lua stays disabled; normal tools work without enabling it.
 
@@ -104,7 +104,7 @@ The plugin logs to `gma3_<version>/onpc/temp/gma3_mcp_bridge.log` under the onPC
 
 ## Update an existing plugin
 
-1. Copy the updated `.lua` files (bridge, hardkeys, feedback) and the `.xml` using your platform setup guide.
+1. Copy the plugin XML and all four Lua files (bridge, hardkeys, feedback and control) using your platform setup guide.
 2. Confirm the pool slot that contains **this bridge**. The example below uses slot 1; change both
    occurrences if your bridge is in another slot. Do not delete a slot containing another plugin.
 3. Run these commands in onPC:

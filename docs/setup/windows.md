@@ -11,7 +11,7 @@ Install grandMA3 onPC, Git and Node.js with npm. Node.js 24 is used by this proj
 image; the package requires Node.js 24 or newer. Launch onPC once to create its resource folders.
 
 ```powershell
-git clone https://github.com/bdstark/gma3-mcp.git
+git clone https://github.com/nf-s/gma3-mcp.git
 Set-Location gma3-mcp
 npm.cmd ci
 npm.cmd run build
@@ -34,7 +34,7 @@ if (-not (Test-Path $gma3Library)) {
 }
 $pluginDirectory = Join-Path $gma3Library 'datapools\plugins'
 New-Item -ItemType Directory -Force -Path $pluginDirectory | Out-Null
-Copy-Item .\plugin\gma3_mcp_bridge.lua, .\plugin\gma3_mcp_hardkeys.lua, .\plugin\gma3_mcp_feedback.lua, .\plugin\gma3_mcp_bridge.xml -Destination $pluginDirectory -Force
+Copy-Item .\plugin\gma3_mcp_*.lua, .\plugin\gma3_mcp_bridge.xml -Destination $pluginDirectory -Force
 ```
 
 ## 3. Import and start the bridge in onPC
@@ -52,6 +52,9 @@ The target slot is required. Save the show to retain the imported plugin, then s
 each time you load the show. Arbitrary Lua stays disabled; normal tools work without enabling it.
 
 ## 4. Configure your MCP client
+
+For indexed manual search, set `GMA3_DOCS_URL` in the environment of the `gma3` server.
+The [documentation settings](../tools/docs.md) cover hosted and local indexes.
 
 Choose [ChatGPT desktop](#chatgpt-desktop), [ChatGPT web](chatgpt-web.md), or
 [Claude Code / Claude Desktop](#claude-code-and-claude-desktop).

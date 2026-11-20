@@ -2,16 +2,24 @@
 
 [README](../../README.md) · [Reference](../reference.md)
 
-Set `GMA3_DOCS_URL=http://127.0.0.1:8765` to use the existing local documentation retrieval API.
-Start that service separately using its own instructions. The MCP does not build, copy or maintain
-another documentation index. This setting accepts only a loopback HTTP origin (`127.0.0.1`, `localhost`
-or `[::1]`), with no path, credentials, query or fragment. Hosted authentication is outside this integration.
+Choose a documentation source in the MCP server's environment and restart the server after changing it.
+
+| `GMA3_DOCS_URL` | Documentation source |
+| --- | --- |
+| `hosted` | Queries the shared index over HTTPS. The setup prompt uses this for new installations. |
+| `http://127.0.0.1:8765` | Queries the index running on the same machine as the MCP. Follow the [ma3-docs setup guide](https://github.com/nf-s/ma3-docs#build-the-local-index) to import publications and start it. |
+| Unset | Reads the manual installed with onPC through `gma3_help`. |
+
+An indexed lookup sends its search terms or document ID, filters and pagination to the selected service.
+Console tools use the bridge independently. If the configured index is unavailable, the lookup reports
+an error. Accepted URL values are the supported hosted HTTPS origin and loopback HTTP origins
+(`127.0.0.1`, `localhost` or `[::1]`) without credentials, a path, a query or a fragment.
 
 When configured, `gma3_help` searches the indexed current manual and returns document text with source
 metadata, or matching IDs when the topic is ambiguous. A unique command/option match takes precedence
 over a physical-key match. Existing bare page names such as `keyword_store.html` still resolve. When
 the setting is absent, `gma3_help` retains its installed-manual behavior through `GMA3_HELP_DIR` or
-`GMA3_INSTALL_DIR`. An explicitly configured but unavailable or malformed index returns an error.
+`GMA3_INSTALL_DIR`. Malformed index responses return an error.
 
 The three additional tools are registered only when the URL is configured. They work without a console
 connection, arbitrary Lua or OSC:
