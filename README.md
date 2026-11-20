@@ -9,51 +9,29 @@ This is a fork of [bdstark/gma3-mcp](https://github.com/bdstark/gma3-mcp).
 Copy this into Claude or ChatGPT with local computer access:
 
 ```text
-Set up https://github.com/nf-s/gma3-mcp on the computer running my grandMA3 onPC.
-Clone or safely update the fork, use Node.js 24+ to run npm ci and npm run build, and
-configure my ChatGPT or Claude client to launch it. For a new setup, set
-GMA3_DOCS_URL=https://ma3-docs.pages.dev in the MCP server environment. Preserve any
-existing local docs setting. Verify a manual
-lookup, then reuse or help me start the onPC bridge and check the connection with gma3_status.
+Set up grandMA3 MCP on my computer. Run docker pull ghcr.io/nf-s/gma3-mcp:latest,
+then follow https://github.com/nf-s/gma3-mcp/blob/main/docs/docker.md to connect the
+image to my ChatGPT or Claude client. Verify offline documentation search by looking
+up the Store keyword. Reuse my running onPC bridge or help me install the plugin from
+the image. Check the connection with gma3_status and preserve my existing settings.
 ```
 
-The snippet uses the [hosted docs](https://ma3-docs.pages.dev). The client starts the MCP server when it connects. If your chat lacks local computer access,
-it can walk you through the same steps. [Detailed setup prompt](docs/setup/ai-setup-prompt.md)
+The client launches the container. A chat without local computer access can guide you through
+installation. Use the [detailed setup prompt](docs/setup/ai-setup-prompt.md) or the
+[Docker guide](docs/docker.md) for exact macOS/Windows plugin-copy and client commands.
+Install Docker and grandMA3 onPC on the host. Your client may ask you to approve the connection.
 
-## Manual setup
+## Setup options and checks
 
-Install grandMA3 onPC, Git and Node.js 24 or newer. Build the server in a terminal.
+Existing native deployments can stay in use. Source installations require Git and Node.js 24+. Follow [macOS](docs/setup/macos.md) or [Windows](docs/setup/windows.md).
+For separate computers use [SSH](docs/remote-access.md). [ChatGPT web](docs/setup/chatgpt-web.md)
+needs a supported tunnel and workspace access.
 
-```sh
-git clone https://github.com/nf-s/gma3-mcp.git
-cd gma3-mcp
-npm ci
-npm run build
-```
-
-On Windows PowerShell, use `npm.cmd`. Follow the platform guide to copy the plugin files,
-import the bridge into a free Plugin slot, start it and configure your MCP client.
-
-| Connection | Guide |
-| --- | --- |
-| macOS | [Install and connect](docs/setup/macos.md) |
-| Windows | [Install and connect](docs/setup/windows.md) |
-| ChatGPT web | [Tunnel setup and access requirements](docs/setup/chatgpt-web.md) |
-| Different computers | [SSH access](docs/remote-access.md) |
-| Optional container | [Docker](docs/docker.md) |
-
-Claude Code and Claude Desktop use stdio MCP configuration. ChatGPT desktop supports local
-stdio configuration. ChatGPT web needs a supported tunnel connection and workspace access.
-A local path or the bridge's TCP address is not a web MCP URL.
-
-## Check the connection
-
-1. Ask your assistant to search the manual for **Store**, open the matching keyword page and
-   return a source link and the publication version. You can do this before starting onPC.
-   For a local index or the installed manual, see [documentation settings](docs/tools/docs.md).
-2. With the bridge running, ask it to call `gma3_status` and report the connected show and
-   onPC version. If that fails, run `node scripts/bridge-cli.mjs ping` on the server computer
-   to check whether the bridge itself answers. [Bridge troubleshooting](docs/setup/bridge.md)
+1. Through your actual client, search for **Store**, retrieve the matching page and references,
+   and check source links and version provenance. This works before importing the bridge.
+2. With the bridge running, call `gma3_status` and confirm the expected show, onPC version,
+   data pool and build state. The [Docker guide](docs/docker.md) covers reaching
+   the bridge's loopback-only listener. [Bridge troubleshooting](docs/setup/bridge.md)
 
 ## Show workflows
 
@@ -107,6 +85,5 @@ See [contributing](CONTRIBUTING.md), the [code of conduct](CODE_OF_CONDUCT.md),
 
 [MIT](LICENSE). grandMA3 and MA Lighting are trademarks of MA Lighting Technology GmbH.
 This independent project is not affiliated with, endorsed by or supported by MA Lighting.
-MA Lighting documentation and libraries are not bundled in this repository. Documentation
-is retrieved from your installed manual or a separately managed service. The plugin uses
+Documentation results retain MA source credits and publication provenance. The plugin uses
 LuaSocket and JSON libraries supplied with onPC.

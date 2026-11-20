@@ -31,6 +31,7 @@ ENTRYPOINT ["sh", "/app/scripts/docker-entrypoint.sh"]
 
 # Opt-in local corpus supplied as a separately prepared, named build context.
 FROM runtime AS offline
+LABEL org.opencontainers.image.source="https://github.com/nf-s/gma3-mcp"
 COPY --from=corpus --chown=node:node / /opt/ma3-docs/
 RUN python3 /opt/ma3-docs/scripts/build_index.py
 ENV GMA3_DOCS_URL=http://127.0.0.1:8765 GMA3_DOCS_LOCAL=1

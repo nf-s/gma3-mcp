@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare an atomic, local-only manual/release corpus build context."""
+"""Prepare an atomic manual/release corpus build context."""
 import argparse
 import json
 import re

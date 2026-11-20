@@ -54,7 +54,7 @@ each time you load the show. Arbitrary Lua stays disabled; normal tools work wit
 ## 4. Configure your MCP client
 
 For indexed manual search, set `GMA3_DOCS_URL` in the environment of the `gma3` server.
-The [documentation settings](../tools/docs.md) cover hosted and local indexes.
+See [documentation settings](../tools/docs.md) for the local index and installed manual.
 
 Choose [ChatGPT desktop](#chatgpt-desktop), [ChatGPT web](chatgpt-web.md), or
 [Claude Code / Claude Desktop](#claude-code-and-claude-desktop).

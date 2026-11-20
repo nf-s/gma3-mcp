@@ -13,7 +13,7 @@
 | `GMA3_OSC_PREFIX` | *(none)* | OSC prefix configured in onPC, without slashes |
 | `GMA3_INSTALL_DIR` | `~/MALightingTechnology` | Base folder containing versioned `gma3_<version>` directories; set explicitly on Windows |
 | `GMA3_HELP_DIR` | *(auto-detected)* | Override with the exact manual HTML directory (`gma3_<version>/shared/language/HTML`) |
-| `GMA3_DOCS_URL` | *(unset)* | Set to `hosted` or a local HTTP loopback origin to enable three read-only docs tools and indexed `gma3_help`. See [indexed docs](tools/docs.md). |
+| `GMA3_DOCS_URL` | *(unset)* | Set to a local HTTP loopback origin to enable three read-only docs tools and indexed `gma3_help`. See [indexed docs](tools/docs.md). |
 | `GMA3_NET_OUTPUT_HOST` | `0.0.0.0` | Bind address of the `gma3_network_output` listener ([docs](tools/network-output.md#configuration)) |
 | `GMA3_NET_OUTPUT_SACN_PORT` / `GMA3_NET_OUTPUT_ARTNET_PORT` | `5568` / `6454` | Ports the listener binds (`0`: ephemeral) |
 | `GMA3_NET_OUTPUT_MULTICAST` | `1` | `0`: the listener joins no sACN multicast groups |
