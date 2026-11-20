@@ -13,7 +13,8 @@ on:
         required: true
 
 permissions:
-  contents: read
+  # GitHub restricts draft release assets to repository writers.
+  contents: write
   packages: write
 
 concurrency: publish-container-image
