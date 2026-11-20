@@ -1,42 +1,43 @@
 # AI-assisted setup
 
-[README](../../README.md) · [Docker](../docker.md) · [macOS](macos.md) · [Windows](windows.md)
+[README](../../README.md) · [macOS](macos.md) · [Windows](windows.md) · [ChatGPT web](chatgpt-web.md)
 
-Copy this into Claude or ChatGPT. Local installation requires local computer tools;
-otherwise the assistant can guide you. Initial onPC import and client approvals may need you.
+Copy this prompt into Claude or ChatGPT. Installation requires local terminal and file access;
+otherwise the assistant can provide instructions. Client approvals, restarts and initial onPC
+import may require your action.
 
 ```text
-Install https://github.com/nf-s/gma3-mcp on my actual computer using the published Docker
-image ghcr.io/nf-s/gma3-mcp:latest. Perform available steps and guide required user actions.
+Install https://github.com/nf-s/gma3-mcp and connect it to grandMA3 onPC with documentation
+search. Perform available steps and give exact instructions for actions requiring me.
 
-Establish my OS, client, Docker availability and whether onPC runs here. Read the repository's
-Docker, platform and bridge guides. Preserve working custom MCP, bridge and local docs
-configurations; this request does not authorise replacing them. Keep personal paths and
-credentials out of shared files. New installs need Docker and onPC, without host Git, Node.js
-or npm. Pull the image explicitly with docker pull ghcr.io/nf-s/gma3-mcp:latest.
+Establish my OS, client, local tools and whether onPC runs on this computer. Read the
+repository's README, applicable AGENTS.md, platform setup, bridge and indexed-documentation
+guides. Keep credentials and personal paths out of shared files and reports.
 
-Configure my client's local stdio server to run the image using the Docker guide's arguments.
-Merge configuration and preserve other servers. Claude Code uses .mcp.json; Claude Desktop
-uses claude_desktop_config.json. ChatGPT desktop uses MCP settings or Codex config.toml.
-The client launches the container; do not use detached mode or a TTY. Follow actual client
-approval/restart requirements. ChatGPT web needs its documented supported tunnel and workspace
-access; local configuration and bridge TCP are not web MCP URLs.
+Use a suitable existing checkout, inspecting edits and branch first; fast-forward only
+when safe. Otherwise clone the public fork. Check Git, onPC and Node.js 24+, then run npm ci
+and npm run build (npm.cmd on Windows).
 
-The image provides offline documentation search. No docs import,
-index build or docs environment override is needed. Before bridge import, verify
-gma3_docs_search, gma3_docs_get and gma3_docs_reference using returned IDs. Check source links,
-authority and version provenance, and test gma3_help.
+Configure gma3 as a stdio MCP server using absolute Node and dist/index.js paths. The client
+launches it. Back up configuration and preserve other entries. Claude Code uses .mcp.json;
+Claude Desktop uses claude_desktop_config.json. Print the repository's configuration
+rather than overwriting existing JSON. ChatGPT desktop uses its MCP settings or Codex
+config.toml. Follow the web guide for ChatGPT web; local configuration and bridge TCP are
+not web MCP URLs. Check actual transport availability and required approvals.
 
-Check for an existing bridge first through gma3_status. If installation is needed, extract
-all plugin files from /app/plugin using docker create, docker cp and docker rm as documented.
-Copy the XML and every referenced Lua component into the actual onPC resource library.
-Have me identify a free Plugin slot, then guide import/start inside my already-open onPC
-session. File copying alone does not import the plugin. Preserve existing plugins and follow
-the update guide for replacements.
+For a new configuration set GMA3_DOCS_URL=https://ma3-docs.pages.dev in the gma3 server
+environment. Preserve an existing local docs URL.
+The local alternative is http://127.0.0.1:8765 with a separately running index. Restart the
+MCP server. Before console import, verify gma3_docs_search, gma3_docs_get and
+gma3_docs_reference using returned IDs, source links and version provenance; test gma3_help.
+Report unavailable docs explicitly; do not silently switch modes or deploy services.
 
-Use the image's default host.docker.internal bridge route on Docker Desktop. Check actual
-reachability; use host networking only as a supported, explicitly enabled fallback and check
-for a local docs port 8765 conflict. Verify gma3_status through my actual client and confirm the expected show,
-version, data pool and build state. Preserve custom ports. Use the SSH guide for separate
-computers. Leave Lua, input and OSC disabled. Report passed checks and remaining user actions.
+Run node scripts/bridge-cli.mjs ping first. Reuse a working bridge. If absent, locate the
+onPC library and copy every XML-referenced plugin component using the platform guide.
+Have me identify a free Plugin slot and import/start the bridge using the documented
+commands. Never overwrite an occupied slot. Reuse my open onPC session; leave Lua, input
+and OSC disabled. Use the SSH guide for separate computers.
+
+Verify gma3_status through my actual client: expected show, version, data pool and fresh
+server build. Report passed checks and remaining steps. Avoid live tests and show changes.
 ```

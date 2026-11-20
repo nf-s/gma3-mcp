@@ -34,10 +34,14 @@ function send(response: http.ServerResponse, value: unknown) {
   response.end(JSON.stringify(value));
 }
 
-test("docs configuration is opt-in and restricted to loopback HTTP origins", () => {
+test("docs configuration is opt-in and accepts only supported hosted or loopback HTTP origins", () => {
   assert.equal(docsClientFromEnvironment(undefined), undefined);
+  const hosted = docsOrigin("hosted");
+  assert.equal(hosted.protocol, "https:");
+  assert.equal(docsOrigin(hosted.origin).href, hosted.href);
+  assert.ok(docsClientFromEnvironment("hosted"));
   for (const value of ["http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765/"]) assert.ok(docsOrigin(value));
-  for (const value of ["", "hosted", "https://docs.example.com", "https://localhost", "http://docs.example.com", "http://192.168.1.2", "http://127.0.0.1/api", "http://a:b@localhost", "http://localhost/?password=secret", "http://localhost/#x", "file:///tmp/docs"]) {
+  for (const value of ["", "https://docs.example.com", "http://docs.example.com", "http://192.168.1.2", "http://127.0.0.1/api", "http://a:b@localhost", "http://localhost/?password=secret", "http://localhost/#x", `${hosted.origin}/api`, `${hosted.origin}/?token=secret`, `${hosted.origin}/#x`, hosted.origin.replace("https://", "https://a:b@"), hosted.origin.replace("https:", "http:"), `${hosted.origin}:8443`, "file:///tmp/docs"]) {
     assert.throws(() => docsOrigin(value));
   }
 });
